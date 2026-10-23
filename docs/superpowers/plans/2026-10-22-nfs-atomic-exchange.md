@@ -198,21 +198,22 @@ Files:
 Interfaces:
 - Consumes: `inspectMetadataExchange`, `finishMetadataExchange`, `tryRemoveMetadataExchangeRecords` (Task 1), and `exchangeMetadataFilesWithRecord` (Task 2).
 - Produces:
-  - Failpoints `ONCE(database_atomic_exchange_fail_before_first_move)`, `ONCE(database_atomic_exchange_fail_after_first_move)`, `ONCE(database_atomic_exchange_fail_after_second_move)` and `ONCE(database_atomic_exchange_fail_after_third_move)`, each throwing `FAULT_INJECTED` at that point in `exchangeMetadataFilesWithRecord`. The first one is this plan's addition. It is the only way to reach the "nothing moved" branch.
+  - Failpoints `ONCE(database_atomic_exchange_fail_before_first_move)`, `ONCE(database_atomic_exchange_fail_after_first_move)`, `ONCE(database_atomic_exchange_fail_after_second_move)` and `ONCE(database_atomic_exchange_fail_after_third_move)`, each throwing `FAULT_INJECTED` at that point in `exchangeMetadataFilesWithRecord`. The first one is this plan's addition. It is the only way to reach the "nothing moved" branch. Being `ONCE`, it does not fire again on the retry.
   - `String unfinished_exchange TSA_GUARDED_BY(mutex);` and `void assertNoUnfinishedExchangeUnlocked() const TSA_REQUIRES(mutex);`, ported from `tmp/pr124937.diff` with the same call sites: `detachTable`, `dropTableImpl`, `renameTable` (both databases), `commitCreateTable` and `commitAlterTable`. It throws `UNFINISHED`.
-  - Warning `Finished the exchange of {} and {} after an error: {}` for `Interrupted`, and warning `The exchange of {} and {} completed despite an error: {}` for `AfterExchange`.
+  - Warning `Finished the exchange of {} and {} after an error: {}` for `Interrupted`, warning `The exchange of {} and {} completed despite an error: {}` for `AfterExchange`, and warning `Retrying the exchange of {} and {} after an error: {}` for `BeforeExchange`.
 
 When a move throws, `exchangeMetadataFilesWithRecord` saves the exception and calls `inspectMetadataExchange`:
 - `Interrupted`: call `finishMetadataExchange`, log the first warning, remove the records, and return normally.
 - `AfterExchange`: log the second warning, remove the records, and return normally.
-- `BeforeExchange`: remove the records and rethrow the saved exception.
-- `Inconsistent`, or any exception from the inspection or the roll forward: set `unfinished_exchange` on both databases, keep the records, and rethrow the saved exception.
+- `BeforeExchange` on the first attempt: log the third warning and run the three moves once more. If the retry throws, inspect again: `Interrupted` and `AfterExchange` are handled as above, and `BeforeExchange` is handled as `Inconsistent`. Never call `finishMetadataExchange` from `BeforeExchange`.
+- `Inconsistent`, or any exception from the inspection, the roll forward, or a second failure: set `unfinished_exchange` on both databases, keep the records, and rethrow the saved exception.
 
 - [ ] Step 1: Write the failing test `atomic_exchange_with_record_failures.sh`
 
   Tags: `zookeeper, no-parallel`. Run each case in `Atomic` and in `Replicated`, with `database_atomic_exchange_with_record` enabled:
   - With `..._after_first_move`, `..._after_second_move` or `..._after_third_move` enabled, `EXCHANGE TABLES a AND b` succeeds. The tables are exchanged, no dot-files remain, and `system.text_log` has the matching warning for the database: the first warning for the first two failpoints, the second warning for the third.
-  - With `..._before_first_move` enabled, `EXCHANGE TABLES a AND b` fails with `FAULT_INJECTED`. The tables are not exchanged, no dot-files remain, and a following `CREATE TABLE c (x UInt8) ENGINE = Memory` succeeds, which shows that no fence was set.
+  - With `..._before_first_move` enabled, `EXCHANGE TABLES a AND b` succeeds through the retry. The tables are exchanged, no dot-files remain, `system.text_log` has the `Retrying the exchange` warning for the database, and a following `CREATE TABLE c (x UInt8) ENGINE = Memory` succeeds, which shows that no fence was set. In `Replicated`, the test also runs `SYSTEM SYNC DATABASE REPLICA` and checks that `system.zookeeper` for the database's `/metadata` path maps `a` and `b` to the same UUIDs as the local tables.
+  - The fence itself is not tested. A raised fence blocks `DETACH DATABASE` and `DROP DATABASE`, because `IDatabase::shouldBeEmptyOnDetach` is `true` for `Atomic` and every table goes through the fenced `detachTable`, so a stateless test could not clean up after it.
 
 - [ ] Step 2: Run the test and confirm it fails
 

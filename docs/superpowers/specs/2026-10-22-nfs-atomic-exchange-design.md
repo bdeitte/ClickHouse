@@ -95,7 +95,7 @@ This is where the design differs from #124937, which undoes the moves. After the
 
 - The temporary file exists: roll forward from the record. Write both recorded contents with `.tmp` files and `replaceFile`, remove the temporary file, and log a warning that includes the original exception. The exchange counts as done, and `renameTable` continues with the in-memory swap.
 - No temporary file, and both files hold the contents after the exchange: the renames succeeded despite the error. Log a warning and continue as done.
-- No temporary file, and both files hold the contents before the exchange: nothing moved. Remove the records and rethrow the original exception. This matches master, where `renameExchange` throwing after the commit fails the query.
+- No temporary file, and both files hold the contents before the exchange: nothing moved. Log a warning that includes the original exception and run the three moves once more. Failing cleanly here, as master does, is wrong for `Replicated`: Keeper already holds the exchange and the new `/digest`, but `DatabaseReplicated::renameTable` updates `tables_metadata_digest` only after `DatabaseAtomic::renameTable` returns, so the next DDL overwrites Keeper's `/digest` with a value from the unexchanged files and the mismatch is never detected. Don't use the roll-forward writes from this state, because without a temporary file a crash between the two writes would leave two files with the same UUID. If the second attempt throws, inspect the files again and apply these rules, except that `BeforeExchange` now counts as "anything else". The same rule applies to `Atomic`, which keeps the code to one path.
 - Anything else, including a failure while reading the files or rolling forward: keep the records, set #124937's in-memory fence on both databases so DDL on them fails with `UNFINISHED` until a restart, and rethrow. The fence is reachable only when the recovery itself fails. Align its details with whatever #124937 settles on.
 
 ### Finishing an exchange at load {#recovery-at-load}
@@ -164,7 +164,7 @@ Decided by the user:
 Calls made in this document, for the user to check:
 - Probe per database in its metadata directory, lazily, at most once under a lock, cached for the life of the database object.
 - Only `DiskLocal`. Object storage stays as on master, including the kernel-version gates.
-- Roll forward on a failed move, instead of #124937's undo. The fence remains only for a failed roll forward.
+- Roll forward on a failed move, instead of #124937's undo. When nothing moved, retry the moves once. The fence remains only for a failed roll forward or a failed retry.
 - No new setting.
 - Skip the two kernel-version gates for `DiskLocal` database disks only.
 - Recovery checks the temporary file's content, in addition to #124937's checks.
