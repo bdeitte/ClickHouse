@@ -19,6 +19,7 @@ namespace DB
 
 namespace ErrorCodes
 {
+    extern const int CANNOT_PARSE_ESCAPE_SEQUENCE;
     extern const int CORRUPTED_DATA;
 }
 
@@ -42,6 +43,12 @@ void replaceMetadataFile(const DiskPtr & disk, const String & path, const String
     disk->replaceFile(path + ".tmp", path);
 }
 
+}
+
+std::mutex & metadataExchangeMutex()
+{
+    static std::mutex mutex;
+    return mutex;
 }
 
 String metadataExchangeRecordPath(const String & metadata_file_path)
@@ -83,9 +90,11 @@ std::optional<MetadataExchangeRecord> parseMetadataExchangeRecord(const String &
                 return {};
         }
     }
-    catch (const Exception &)
+    catch (const Exception & e)
     {
-        /// Ok: malformed escaping means the content is not a record.
+        /// Malformed escaping is the only error `readEscapedString` throws on malformed input: the content is not a record.
+        if (e.code() != ErrorCodes::CANNOT_PARSE_ESCAPE_SEQUENCE)
+            throw;
         return {};
     }
     if (!in.eof() || record.old_path.empty() || record.new_path.empty())
@@ -159,8 +168,7 @@ void finishMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord &
 void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & metadata_dir, bool fsync, const LoggerPtr & log)
 {
     /// The two databases of an exchange between databases can be loaded at the same time, and both may act on its record.
-    static std::mutex mutex;
-    std::lock_guard lock(mutex);
+    std::lock_guard lock(metadataExchangeMutex());
 
     const String record_suffix = String(".sql") + exchange_record_suffix;
     const String record_tmp_suffix = record_suffix + ".tmp";

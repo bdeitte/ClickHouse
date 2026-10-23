@@ -4,6 +4,7 @@
 #include <Disks/IDisk.h>
 #include <Common/Logger.h>
 
+#include <mutex>
 #include <optional>
 
 
@@ -23,6 +24,9 @@ struct MetadataExchangeRecord
     String old_path_content;
     String new_path_content;
 };
+
+/// Held both by the loader in `finishInterruptedMetadataExchanges` and by the exchange writer, so that neither sees the other's records half done.
+std::mutex & metadataExchangeMutex();
 
 /// `dir/a.sql` -> `dir/.a.sql.exchange`: listings of metadata directories skip names starting with a dot.
 String metadataExchangeRecordPath(const String & metadata_file_path);
