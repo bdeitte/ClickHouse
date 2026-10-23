@@ -7,6 +7,8 @@
 #include <Databases/DatabaseMetadataDiskSettings.h>
 #include <Databases/DatabaseOnDisk.h>
 #include <Databases/DatabaseReplicated.h>
+#include <Databases/MetadataExchange.h>
+#include <Disks/DiskLocal.h>
 #include <Disks/IStoragePolicy.h>
 #include <Interpreters/DDLTask.h>
 #include <Interpreters/DatabaseCatalog.h>
@@ -33,6 +35,7 @@ namespace Setting
 {
     extern const SettingsBool check_referential_table_dependencies;
     extern const SettingsBool check_table_dependencies;
+    extern const SettingsBool fsync_metadata;
 }
 
 namespace FailPoints
@@ -586,6 +589,22 @@ void DatabaseAtomic::beforeLoadingMetadata(ContextMutablePtr /*context*/, Loadin
 
         db_disk->removeFileIfExists(table_path);
     }
+}
+
+void DatabaseAtomic::loadTablesMetadata(ContextPtr local_context, ParsedTablesMetadata & metadata, bool is_startup)
+{
+    auto db_disk = getDisk();
+    if (canEmulateExchange(db_disk) && !db_disk->isReadOnly() && db_disk->existsDirectory(getMetadataPath()))
+    {
+        const bool fsync = getContext()->getGlobalContext()->getSettingsRef()[Setting::fsync_metadata];
+        finishInterruptedMetadataExchanges(db_disk, getMetadataPath(), fsync, log);
+    }
+    DatabaseOrdinary::loadTablesMetadata(local_context, metadata, is_startup);
+}
+
+bool DatabaseAtomic::canEmulateExchange(const DiskPtr & disk)
+{
+    return dynamic_cast<const DiskLocal *>(disk.get()) != nullptr;
 }
 
 LoadTaskPtr DatabaseAtomic::startupDatabaseAsync(AsyncLoader & async_loader, LoadJobSet startup_after, LoadingStrictnessLevel mode)

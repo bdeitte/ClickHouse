@@ -63,6 +63,12 @@ public:
 
     void beforeLoadingMetadata(ContextMutablePtr context, LoadingStrictnessLevel mode) override;
 
+    /// Finishes the exchanges of metadata files that a crash interrupted, then loads the metadata.
+    void loadTablesMetadata(ContextPtr local_context, ParsedTablesMetadata & metadata, bool is_startup) override;
+
+    /// Whether an exchange of metadata files on `disk` can be done with three moves and a record when the disk has no atomic exchange.
+    static bool canEmulateExchange(const DiskPtr & disk);
+
     LoadTaskPtr startupDatabaseAsync(AsyncLoader & async_loader, LoadJobSet startup_after, LoadingStrictnessLevel mode) override;
     void waitDatabaseStarted() const override;
     void stopLoading() override;
