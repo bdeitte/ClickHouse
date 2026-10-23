@@ -852,8 +852,11 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
             catch (...)
             {
                 /// A failed move on a local disk usually arrives as `std::filesystem::filesystem_error`, which cannot carry the hint.
-                /// The new exception keeps its code and message.
-                auto e = Exception::createRuntime(getCurrentExceptionCode(), getCurrentExceptionMessage(/* with_stacktrace */ false));
+                /// The new exception keeps its code and message. The version is left out, because the final report adds it.
+                auto e = Exception::createRuntime(
+                    getCurrentExceptionCode(),
+                    getCurrentExceptionMessage(
+                        /* with_stacktrace */ false, /* check_embedded_stacktrace */ false, /* with_extra_info */ true, /* with_version */ false));
                 e.addMessage(hint);
                 throw e;
             }
