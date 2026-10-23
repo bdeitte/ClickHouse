@@ -432,7 +432,8 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
 
     /// Table renaming actually begins here
     auto txn = local_context->getZooKeeperMetadataTransaction();
-    if (txn && !local_context->isInternalSubquery())
+    const bool has_keeper_transaction = txn && !local_context->isInternalSubquery();
+    if (has_keeper_transaction)
     {
         try
         {
@@ -453,7 +454,7 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
     /// NOTE: replica will be lost if server crashes before the following rename
     /// TODO better detection and recovery
     if (use_record)
-        exchangeMetadataFilesWithRecord(other_db, db_disk, record, record_paths, fsync, /* has_keeper_transaction */ txn != nullptr);
+        exchangeMetadataFilesWithRecord(other_db, db_disk, record, record_paths, fsync, has_keeper_transaction);
     else if (exchange)
         db_disk->renameExchange(old_metadata_path, new_metadata_path);
     else
@@ -555,7 +556,9 @@ void DatabaseAtomic::commitAlterTable(const StorageID & table_id, const String &
 void DatabaseAtomic::assertNoUnfinishedExchangeUnlocked() const
 {
     if (!unfinished_exchange.empty())
-        throw Exception(ErrorCodes::UNFINISHED, "An exchange of {} in database {} failed and could not be finished; restart the server to finish it",
+        throw Exception(ErrorCodes::UNFINISHED,
+                        "An exchange of {} in database {} failed and could not be finished; "
+                        "restart the server, the next load finishes the exchange or reports why it cannot",
                         unfinished_exchange, backQuote(database_name));
 }
 
@@ -749,7 +752,8 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
     };
 
     /// A move can also report an error after it succeeded, so the state of the files decides, not the error.
-    /// Once Keeper holds the exchange, rolling forward is the right direction, because a restart does the same.
+    /// Once Keeper holds the exchange, rolling forward is the right direction, because that is what Keeper recorded,
+    /// and a load finishes an interrupted exchange the same way.
     std::exception_ptr error;
     auto handle_error = [&](bool retried) noexcept -> Outcome
     {
@@ -803,10 +807,12 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
 
     if (outcome == Outcome::Fence)
     {
-        /// The records stay, so that the next load finishes the exchange. Until then, DDL on both databases fails.
+        /// The records stay for the next load, and until then DDL on both databases fails. The next load finishes an `Interrupted`
+        /// exchange. Without the temporary file it only removes the records: in `Replicated`, the digest check then repairs files that
+        /// are behind Keeper. With the temporary file in any other state, the load reports `CORRUPTED_DATA` and the files need manual repair.
         unfinished_exchange = fmt::format("{} and {}", record.old_path, record.new_path);
         other_db.unfinished_exchange = unfinished_exchange;
-        LOG_ERROR(log, "Cannot finish the exchange of {}, DDL on the databases of both files fails until a restart", unfinished_exchange);
+        LOG_ERROR(log, "Cannot finish the exchange of {}, DDL on the databases of both files fails until the next load", unfinished_exchange);
         std::rethrow_exception(error);
     }
 

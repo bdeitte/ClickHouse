@@ -87,6 +87,17 @@ function print_tables_with_y()
         FROM system.columns WHERE database = '$1' AND name = 'y'"
 }
 
+# Prints which of the metadata files `a.sql` and `b.sql` in the metadata directory $1 define column `y`.
+function print_files_with_y()
+{
+    local with_y=() name
+    for name in a.sql b.sql
+    do
+        grep -q '`y` UInt8' "${1%/}/$name" && with_y+=("$name")
+    done
+    echo "on disk has y: ${with_y[*]}"
+}
+
 # Prints the number of dot-files, such as exchange records, and of files that are not metadata files,
 # such as a temporary file of an exchange, in the metadata directory $1.
 function print_leftover_files()
@@ -119,6 +130,7 @@ function exchange_with_failpoint()
     $CLIENT -q "EXCHANGE TABLES $1.a AND $1.b"
     $CLICKHOUSE_CLIENT -q "SYSTEM DISABLE FAILPOINT $3"
     print_tables_with_y "$1"
+    print_files_with_y "$2"
     print_leftover_files "$2"
     print_warning "$1" "$4" "$since"
 }
@@ -146,6 +158,7 @@ $CLICKHOUSE_CLIENT -q "SYSTEM ENABLE FAILPOINT database_atomic_exchange_always_f
 $CLIENT -q "EXCHANGE TABLES $DB_ATOMIC.a AND $DB_ATOMIC.b" 2>&1 | grep -o 'FAULT_INJECTED' | head -n1
 $CLICKHOUSE_CLIENT -q "SYSTEM DISABLE FAILPOINT database_atomic_exchange_always_fail_before_first_move"
 print_tables_with_y "$DB_ATOMIC"
+print_files_with_y "$DIR_ATOMIC"
 print_leftover_files "$DIR_ATOMIC"
 # No fence was raised.
 $CLIENT -q "CREATE TABLE $DB_ATOMIC.d (x UInt8) ENGINE = Memory" && echo "created d"
