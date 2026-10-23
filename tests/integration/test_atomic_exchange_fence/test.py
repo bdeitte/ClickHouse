@@ -54,6 +54,10 @@ def test_fence_until_restart(started_cluster):
         " ENGINE = ReplicatedMergeTree ORDER BY x"
     )
     node.query("INSERT INTO fence_db.b VALUES (1, 2)")
+    # Not part of the exchange: the fence refuses to drop or detach it all the same.
+    node.query(
+        "CREATE TABLE fence_db.untouched (x UInt8) ENGINE = ReplicatedMergeTree ORDER BY x"
+    )
 
     node.query("SYSTEM ENABLE FAILPOINT database_atomic_exchange_with_record")
     node.query(
@@ -78,6 +82,14 @@ def test_fence_until_restart(started_cluster):
     # before either changes anything.
     assert "UNFINISHED" in node.query_and_get_error("DETACH DATABASE fence_db")
     assert "UNFINISHED" in node.query_and_get_error("DROP DATABASE fence_db")
+    # The fence refuses to drop or detach a table before the table is shut down,
+    # so an insert into the `ReplicatedMergeTree` table still succeeds.
+    for query in ["DROP TABLE fence_db.untouched", "DETACH TABLE fence_db.untouched"]:
+        assert "UNFINISHED" in node.query_and_get_error(
+            query, settings={"distributed_ddl_output_mode": "none"}
+        )
+    node.query("INSERT INTO fence_db.untouched VALUES (1)")
+    assert node.query("SELECT count() FROM fence_db.untouched").strip() == "1"
 
     node.restart_clickhouse()
 

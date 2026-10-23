@@ -570,6 +570,12 @@ void DatabaseAtomic::checkCanBeDroppedOrDetached() const
     assertNoUnfinishedExchangeUnlocked();
 }
 
+void DatabaseAtomic::checkTablesCanBeDroppedOrDetached() const
+{
+    std::lock_guard lock{mutex};
+    assertNoUnfinishedExchangeUnlocked();
+}
+
 void DatabaseAtomic::assertNoUnfinishedExchangeUnlocked() const
 {
     if (!unfinished_exchange.empty())
