@@ -132,8 +132,8 @@ There is no real NFS or EFS mount available. Verification relies on failpoints a
 - Stateless `.sh` tests, created with `tests/queries/0_stateless/add-test`, with the probe failpoint enabled:
   - Each statement in the intent works and leaves no record behind. Run them in an `Atomic` database, in a `Replicated` database, and across two databases.
   - Each move failpoint leaves the query successful with the tables exchanged.
-  - Each crash state recovers on `DETACH DATABASE` and `ATTACH DATABASE`: record only, record with the temporary file after each move, a leftover `<record>.tmp`, a leftover probe file, a stale copy whose primary a newer exchange overwrote, and a file matching neither content.
-  - Two exchanges that start at the same time in a fresh database both succeed, which covers the probe lock. Build the states by hand as files, using #124937's `05340` test as the model.
+  - Each crash state recovers on `DETACH DATABASE` and `ATTACH DATABASE`: record only, record with the temporary file after each move, a leftover `<record>.tmp`, a leftover probe file, a stale copy whose primary a newer exchange overwrote, and a file matching neither content. The test runs against the server: it runs `DETACH DATABASE`, writes each state as files into the database's metadata directory (taken from `system.databases`), and runs `ATTACH DATABASE`, which reaches `loadTablesMetadata` through `TablesLoader`. This covers `Replicated` too. #124937's `05340` test uses `clickhouse-local` and `clickhouse-disks` and has no `Replicated` case, so use it only as the model for the list of states.
+  - Two exchanges that start at the same time in a fresh database both succeed, which covers the probe lock.
 - These tests run on the native macOS build, because the failpoint forces the emulated path. APFS supports the exchange natively, so the path never runs there without the failpoint.
 - A manual check before the PR leaves draft: run a CI-built Linux binary in Docker on the Mac with a seccomp profile that returns `EINVAL` for `renameat2` with any non-zero flags, which reproduces NFS behavior for both `RENAME_EXCHANGE` and `RENAME_NOREPLACE`. In that container, run the statements, then a `kill -9` loop during `EXCHANGE TABLES` with a restart after each kill, and confirm that every restart succeeds. Also try a Docker Desktop bind mount to see whether #83524 is fixed.
 
@@ -148,7 +148,7 @@ There is no real NFS or EFS mount available. Verification relies on failpoints a
 - Names of the failpoints, the probe files, and new methods.
 - How the `DiskLocal` check is written.
 - Where the cached probe answer lives in `DatabaseAtomic`, and how it is synchronized.
-- How tests inspect metadata files on disk, and how the tests are split.
+- How the tests are split.
 - The changelog category.
 
 ## Decisions {#decisions}
@@ -168,3 +168,4 @@ Calls made in this document, for the user to check:
 - `renameNoReplace`, `FormatSchemaInfo`, and errno changes are out of scope.
 - Process-wide mutex for recovery at load.
 - A seccomp profile in Docker as the manual stand-in for NFS.
+- Crash-state tests run against the server with `DETACH DATABASE` and `ATTACH DATABASE`, not with `clickhouse-local`.
