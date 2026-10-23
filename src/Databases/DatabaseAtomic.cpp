@@ -282,8 +282,10 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
     }
 
     /// On a local disk, an exchange the filesystem cannot do atomically is done with a record, see `canExchangeAtomically`.
+    /// Both databases must be on local disks: otherwise the exchange behaves as before the record existed.
+    const bool can_emulate_exchange = exchange && canEmulateExchange(getDisk()) && canEmulateExchange(to_database.getDisk());
     std::string message;
-    if (exchange && !canEmulateExchange(getDisk()) && !supportsAtomicRename(&message))
+    if (exchange && !can_emulate_exchange && !supportsAtomicRename(&message))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "RENAME EXCHANGE is not supported because exchanging files is not supported by the OS ({})", message);
 
     createDirectories();
@@ -354,7 +356,7 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
     /// Probe after `waitDatabaseStarted`, so that loading has removed the probe files a crash left,
     /// and before the locks of the databases, so that a probe does not hold them while it writes files.
     bool use_record = false;
-    if (exchange && canEmulateExchange(getDisk()))
+    if (can_emulate_exchange)
     {
         /// Both databases are probed, even when the first one already needs the record.
         const bool atomic_in_this_db = canExchangeAtomically();
@@ -761,6 +763,8 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
     /// Once Keeper holds the exchange, rolling forward is the right direction, because that is what Keeper recorded,
     /// and a load finishes an interrupted exchange the same way.
     std::exception_ptr error;
+    /// Built here, so that the `catch` of the `noexcept` lambda below does not allocate.
+    const String finish_error_prefix = fmt::format("Cannot finish the exchange of {} and {}", record.old_path, record.new_path);
     auto handle_error = [&](bool retried) noexcept -> Outcome
     {
         try
@@ -788,7 +792,7 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
         }
         catch (...)
         {
-            tryLogCurrentException(log, fmt::format("Cannot finish the exchange of {} and {}", record.old_path, record.new_path));
+            tryLogCurrentException(log, finish_error_prefix);
         }
         return Outcome::Fence;
     };
@@ -832,17 +836,26 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
         }
         if (tmp_exists)
         {
+            const String hint = fmt::format(
+                "The temporary file {} is left, so the next load finishes the exchange from its record, "
+                "or reports `CORRUPTED_DATA` if the files hold none of the recorded contents",
+                tmp_path);
             try
             {
                 std::rethrow_exception(error);
             }
             catch (Exception & e)
             {
-                e.addMessage(
-                    "The temporary file {} is left, so the next load finishes the exchange from its record, "
-                    "or reports `CORRUPTED_DATA` if the files hold none of the recorded contents",
-                    tmp_path);
+                e.addMessage(hint);
                 throw;
+            }
+            catch (...)
+            {
+                /// A failed move on a local disk usually arrives as `std::filesystem::filesystem_error`, which cannot carry the hint.
+                /// The new exception keeps its code and message.
+                auto e = Exception::createRuntime(getCurrentExceptionCode(), getCurrentExceptionMessage(/* with_stacktrace */ false));
+                e.addMessage(hint);
+                throw e;
             }
         }
         std::rethrow_exception(error);

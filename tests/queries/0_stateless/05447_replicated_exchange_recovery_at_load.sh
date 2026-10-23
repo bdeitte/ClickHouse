@@ -126,7 +126,7 @@ function attach_and_check()
     $CLICKHOUSE_CLIENT -q "ATTACH DATABASE $DB"
 
     local digests_equal=""
-    for _ in $(seq 1 120)
+    for _ in $(seq 1 300)
     do
         $CLICKHOUSE_CLIENT -q "SYSTEM FLUSH LOGS text_log"
         digests_equal=$($CLICKHOUSE_CLIENT -q "
@@ -148,6 +148,8 @@ function attach_and_check()
     fi
 
     echo "local digest equals Keeper digest: $digests_equal"
+    # The lost replica warning follows the digest message closely, so the flush above may have missed it.
+    $CLICKHOUSE_CLIENT -q "SYSTEM FLUSH LOGS text_log"
     $CLICKHOUSE_CLIENT -q "
         SELECT 'lost replica messages: ' || toString(count())
         FROM system.text_log
