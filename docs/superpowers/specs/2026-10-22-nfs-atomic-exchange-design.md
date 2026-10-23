@@ -72,20 +72,20 @@ The table name in `Atomic` metadata is the file name. The file contents are `ATT
 
 Decided: a probe, not "try the syscall first and fall back". Trying first would put the record after the Keeper commit.
 
-- The probe runs per database, in the database's metadata directory, the first time that database performs an exchange. It runs before `renameTable` takes the database mutexes. The answer is cached for the lifetime of the database object. A per-database probe is more precise than a per-disk one because a metadata directory can be on a different mount from the disk root.
+- The probe runs per database, in the database's metadata directory, the first time that database performs an exchange. It runs after `renameTable` has called `waitDatabaseStarted` on both databases, so the cleanup at load has finished, and before `renameTable` takes the database mutexes. The `supportsAtomicRename` check it replaces runs earlier, before `waitDatabaseStarted`, so the probe must not simply take that check's place. The answer is cached for the lifetime of the database object. A per-database probe is more precise than a per-disk one because a metadata directory can be on a different mount from the disk root.
 - Two exchanges in one database can start at the same time, for example two refreshable materialized views refreshing after startup. So the probe runs at most once per database, under a lock that concurrent callers wait on. If the probe throws, the answer stays unset and the next exchange probes again.
 - The probe creates two small dot-prefixed scratch files with unique names in the metadata directory, calls `IDisk::renameExchangeIfSupported` on them, and removes them. The probe never removes other files. Leftovers from a crashed probe are removed by pattern in `finishInterruptedExchanges` at load, when no probe can be running. `DatabaseOnDisk::iterateMetadataFiles` skips dot-prefixed names on every disk, so a leftover never breaks loading.
 - `renameExchangeIfSupported` already returns `false` for "unsupported" and throws for every other error. The probe lets those errors propagate.
 - The probe runs only when the database disk is a `DiskLocal`. Other disks keep master behavior.
 - For an exchange between two databases, both databases are probed. The record path is used if either one reports "unsupported".
-- A new `REGULAR` failpoint makes the probe report "unsupported" whatever the cached answer is. It exists for tests.
+- A new `REGULAR` failpoint makes the exchange take the record path. It is checked after the real probe has run and its answer is cached, so tests still exercise the probe, its lock, and its scratch files. It exists for tests.
 
 ### Exchanging with a record {#exchange-with-record}
 
 When the probe reports "unsupported", `renameTable` performs these steps in place of `db_disk->renameExchange`:
 
 1. Before the Keeper commit, it writes the record `.<file>.exchange` next to `old_path`, plus a copy next to `new_path` when the two databases' directories differ. The format is #124937's: the header line `exchange v1`, then `old_path`, `new_path`, and the contents each path will have after the exchange, each escaped and on its own line. Each record is written as `<record>.tmp` and then put in place with `replaceFile`.
-2. The existing Keeper commit runs. If it throws, nothing has moved, so remove the records and rethrow.
+2. The existing Keeper commit runs. If it throws, nothing has moved. Remove the records on a best-effort basis, logging any failure, and always rethrow the Keeper exception. A record left behind here is harmless because no temporary file exists, and the next load removes it.
 3. Three moves follow through `db_disk->moveFile`: `old_path` to `old_path + ".tmp_exchange"`, `new_path` to `old_path`, and the temporary file to `new_path`.
 4. The records are removed. This step is best effort. A record without its temporary file is harmless and gets removed at the next load.
 
