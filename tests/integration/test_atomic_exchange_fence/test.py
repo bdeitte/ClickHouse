@@ -43,9 +43,15 @@ def test_fence_until_restart(started_cluster):
         "CREATE DATABASE fence_db"
         " ENGINE = Replicated('/clickhouse/databases/fence_db', 'shard1', 'replica1')"
     )
-    node.query("CREATE TABLE fence_db.a (x UInt8) ENGINE = MergeTree ORDER BY x")
+    # `ReplicatedMergeTree`, because the digest repair after the restart matches such tables by UUID
+    # and renames them, keeping their data. It would recreate exchanged plain `MergeTree` tables
+    # from Keeper metadata and move the originals with the data to the broken-tables database.
     node.query(
-        "CREATE TABLE fence_db.b (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x"
+        "CREATE TABLE fence_db.a (x UInt8) ENGINE = ReplicatedMergeTree ORDER BY x"
+    )
+    node.query(
+        "CREATE TABLE fence_db.b (x UInt8, y UInt8)"
+        " ENGINE = ReplicatedMergeTree ORDER BY x"
     )
     node.query("INSERT INTO fence_db.b VALUES (1, 2)")
 
