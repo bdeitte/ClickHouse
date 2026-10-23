@@ -5,6 +5,7 @@
 #include <Databases/DatabasesCommon.h>
 #include <Databases/MetadataExchange.h>
 #include <Storages/IStorage_fwd.h>
+#include <Common/SharedMutex.h>
 
 #include <mutex>
 #include <optional>
@@ -95,7 +96,13 @@ public:
     void checkDetachedTableNotInUse(const UUID & uuid) override;
     void setDetachedTableNotInUseForce(const UUID & uuid) override;
 
+    /// Waits for the moves of an exchange with a record, see `metadata_files_mutex`.
+    time_t getObjectMetadataModificationTime(const String & object_name) const override;
+
 protected:
+    /// Waits for the moves of an exchange with a record, see `metadata_files_mutex`.
+    ASTPtr readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const override;
+
     void commitAlterTable(const StorageID & table_id, const String & table_metadata_tmp_path, const String & table_metadata_path, const String & statement, ContextPtr query_context) override;
     void commitCreateTable(const ASTCreateQuery & query, const StoragePtr & table,
                            const String & table_metadata_tmp_path, const String & table_metadata_path, ContextPtr query_context) override;
@@ -150,6 +157,13 @@ private:
     String unfinished_exchange TSA_GUARDED_BY(mutex);
     /// What the restart does about the unfinished exchange, for the error of DDL until then.
     String unfinished_exchange_hint TSA_GUARDED_BY(mutex);
+
+    /// Held exclusively by `exchangeMetadataFilesWithRecord` while it moves the metadata files, and shared by the readers
+    /// of metadata files that do not take `mutex`, such as `SHOW CREATE TABLE`, `system.tables` and `BACKUP`,
+    /// so that they never see a file missing between the moves, as with an atomic exchange.
+    /// It is taken after `mutex` and `metadataExchangeMutex`, so a reader must not take `mutex` while holding it:
+    /// the shared lock covers only the read of the file, not `getDatabaseName`, which takes `mutex`.
+    mutable SharedMutex metadata_files_mutex;
 
     std::mutex exchange_probe_mutex;
     std::optional<bool> exchange_is_atomic TSA_GUARDED_BY(exchange_probe_mutex);

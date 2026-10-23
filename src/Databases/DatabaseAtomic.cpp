@@ -576,6 +576,18 @@ void DatabaseAtomic::checkTablesCanBeDroppedOrDetached() const
     assertNoUnfinishedExchangeUnlocked();
 }
 
+ASTPtr DatabaseAtomic::readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const
+{
+    std::shared_lock lock(metadata_files_mutex);
+    return DatabaseOrdinary::readCreateQueryFromMetadataFile(table_name, throw_on_error);
+}
+
+time_t DatabaseAtomic::getObjectMetadataModificationTime(const String & object_name) const
+{
+    std::shared_lock lock(metadata_files_mutex);
+    return DatabaseOrdinary::getObjectMetadataModificationTime(object_name);
+}
+
 void DatabaseAtomic::assertNoUnfinishedExchangeUnlocked() const
 {
     if (!unfinished_exchange.empty())
@@ -737,6 +749,13 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
 {
     /// Loading another database must not act on the records while the files move, or while a failure of a move is handled.
     std::lock_guard exchange_lock(metadataExchangeMutex());
+
+    /// Readers of the metadata files wait until the moves and the handling of their failure are over.
+    /// Every exclusive holder of `metadata_files_mutex` holds `metadataExchangeMutex`, so the two locks cannot deadlock.
+    std::unique_lock files_lock(metadata_files_mutex);
+    std::unique_lock<SharedMutex> other_files_lock;
+    if (&other_db != this)
+        other_files_lock = std::unique_lock(other_db.metadata_files_mutex);
 
     LOG_DEBUG(log, "Exchanging {} and {} with an exchange record", record.old_path, record.new_path);
     const String tmp_path = metadataExchangeTmpPath(record.old_path);

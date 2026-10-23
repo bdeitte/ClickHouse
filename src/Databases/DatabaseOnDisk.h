@@ -129,6 +129,8 @@ protected:
         bool throw_on_error) const override;
 
     virtual ASTPtr getCreateQueryFromMetadata(const String & table_name, bool throw_on_error) const;
+    /// Reads and parses the metadata file of `table_name` for `getCreateQueryFromMetadata`. An override must not take `mutex`.
+    virtual ASTPtr readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const;
     ASTPtr getCreateQueryFromStorage(const String & table_name, const StoragePtr & storage, bool throw_on_error) const;
 
     virtual void commitCreateTable(const ASTCreateQuery & query, const StoragePtr & table,
