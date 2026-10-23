@@ -1,5 +1,6 @@
 #include <filesystem>
 #include <thread>
+#include <Core/ServerSettings.h>
 #include <Core/Settings.h>
 #include <Core/UUID.h>
 #include <Databases/DatabaseAtomic.h>
@@ -38,6 +39,11 @@ namespace Setting
     extern const SettingsBool check_referential_table_dependencies;
     extern const SettingsBool check_table_dependencies;
     extern const SettingsBool fsync_metadata;
+}
+
+namespace ServerSetting
+{
+    extern const ServerSettingsBool database_atomic_allow_exchange_emulation;
 }
 
 namespace FailPoints
@@ -282,8 +288,11 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
     }
 
     /// On a local disk, an exchange the filesystem cannot do atomically is done with a record, see `canExchangeAtomically`.
-    /// Both databases must be on local disks: otherwise the exchange behaves as before the record existed.
-    const bool can_emulate_exchange = exchange && canEmulateExchange(getDisk()) && canEmulateExchange(to_database.getDisk());
+    /// Both databases must be on local disks, and the server setting can turn the emulation off:
+    /// otherwise the exchange behaves as before the record existed.
+    const bool can_emulate_exchange = exchange
+        && local_context->getServerSettings()[ServerSetting::database_atomic_allow_exchange_emulation]
+        && canEmulateExchange(getDisk()) && canEmulateExchange(to_database.getDisk());
     std::string message;
     if (exchange && !can_emulate_exchange && !supportsAtomicRename(&message))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "RENAME EXCHANGE is not supported because exchanging files is not supported by the OS ({})", message);
