@@ -125,6 +125,9 @@ private:
 
     /// Exchanges the two metadata files of `record` with three moves, instead of an atomic exchange,
     /// and removes the records at `record_paths` that `writeMetadataExchangeRecords` wrote before the Keeper commit.
+    /// When a move throws, it reads the files and rolls the exchange forward from the record. When it cannot,
+    /// it keeps the records, sets `unfinished_exchange` on both databases and rethrows.
+    /// The caller holds `mutex` of both databases.
     void exchangeMetadataFilesWithRecord(
         DatabaseAtomic & other_db,
         const DiskPtr & disk,
@@ -132,6 +135,12 @@ private:
         const Strings & record_paths,
         bool fsync,
         bool has_keeper_transaction) TSA_NO_THREAD_SAFETY_ANALYSIS;
+
+    void assertNoUnfinishedExchangeUnlocked() const TSA_REQUIRES(mutex);
+
+    /// Set when an exchange failed and could not be finished, so the metadata files may be half exchanged.
+    /// DDL on the database fails until a restart finishes the exchange from its record.
+    String unfinished_exchange TSA_GUARDED_BY(mutex);
 
     std::mutex exchange_probe_mutex;
     std::optional<bool> exchange_is_atomic TSA_GUARDED_BY(exchange_probe_mutex);

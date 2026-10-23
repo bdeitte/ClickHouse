@@ -44,6 +44,11 @@ namespace FailPoints
 {
     extern const char rename_database_after_dependency_check[];
     extern const char database_atomic_exchange_with_record[];
+    extern const char database_atomic_exchange_fail_before_first_move[];
+    extern const char database_atomic_exchange_fail_after_first_move[];
+    extern const char database_atomic_exchange_fail_after_second_move[];
+    extern const char database_atomic_exchange_fail_after_third_move[];
+    extern const char database_atomic_exchange_always_fail_before_first_move[];
 }
 
 namespace ErrorCodes
@@ -59,6 +64,7 @@ namespace ErrorCodes
     extern const int ABORTED;
     extern const int LOGICAL_ERROR;
     extern const int UNFINISHED;
+    extern const int FAULT_INJECTED;
 }
 
 
@@ -188,6 +194,7 @@ StoragePtr DatabaseAtomic::detachTable(ContextPtr /* context */, const String & 
     StoragePtr detached_table;
     {
         std::lock_guard lock(mutex);
+        assertNoUnfinishedExchangeUnlocked();
         detached_table = DatabaseOrdinary::detachTableUnlocked(name);
         table_name_to_path.erase(name);
         detached_tables.emplace(detached_table->getStorageID().uuid, detached_table);
@@ -226,6 +233,7 @@ void DatabaseAtomic::dropTableImpl(ContextPtr local_context, const String & tabl
     auto db_disk = getDisk();
     {
         std::lock_guard lock(mutex);
+        assertNoUnfinishedExchangeUnlocked();
         table = getTableUnlocked(table_name);
         table_metadata_path_drop = DatabaseCatalog::instance().getPathForDroppedMetadata(table->getStorageID());
 
@@ -370,6 +378,10 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
         db_lock = std::unique_lock{mutex};
     }
 
+    assertNoUnfinishedExchangeUnlocked();
+    if (!inside_database)
+        other_db.assertNoUnfinishedExchangeUnlocked();
+
     if (!exchange)
         other_db.checkMetadataFilenameAvailabilityUnlocked(to_table_name);
 
@@ -403,7 +415,9 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
     auto db_disk = getDisk();
     const bool fsync = local_context->getSettingsRef()[Setting::fsync_metadata];
 
-    /// The record is in place before the commit point, so that a crash after the commit finishes the exchange at load.
+    /// The record lets a load finish an exchange that a crash interrupted between the moves, and a failure during the moves
+    /// rolls the exchange forward from it. It is written before the commit point, so that nothing is added between it and the moves.
+    /// In `Replicated`, a crash before the first move leaves Keeper ahead of the files, which the digest check at the next start repairs.
     MetadataExchangeRecord record;
     Strings record_paths;
     if (use_record)
@@ -481,6 +495,7 @@ void DatabaseAtomic::commitCreateTable(const ASTCreateQuery & query, const Stora
         if (query.getDatabase() != database_name)
             throw Exception(ErrorCodes::UNKNOWN_DATABASE, "Database was renamed to `{}`, cannot create table in `{}`",
                             database_name, query.getDatabase());
+        assertNoUnfinishedExchangeUnlocked();
         /// Do some checks before renaming file from .tmp to .sql
         not_in_use = cleanupDetachedTables();
         assertDetachedTableNotInUse(query.uuid);
@@ -519,6 +534,7 @@ void DatabaseAtomic::commitAlterTable(const StorageID & table_id, const String &
     });
 
     std::lock_guard lock{mutex};
+    assertNoUnfinishedExchangeUnlocked();
     auto actual_table_id = getTableUnlocked(table_id.table_name)->getStorageID();
 
     if (table_id.uuid != actual_table_id.uuid)
@@ -534,6 +550,13 @@ void DatabaseAtomic::commitAlterTable(const StorageID & table_id, const String &
     check_file_exists = db_disk->renameExchangeIfSupported(table_metadata_tmp_path, table_metadata_path);
     if (!check_file_exists)
         db_disk->replaceFile(table_metadata_tmp_path, table_metadata_path);
+}
+
+void DatabaseAtomic::assertNoUnfinishedExchangeUnlocked() const
+{
+    if (!unfinished_exchange.empty())
+        throw Exception(ErrorCodes::UNFINISHED, "An exchange of {} in database {} failed and could not be finished; restart the server to finish it",
+                        unfinished_exchange, backQuote(database_name));
 }
 
 void DatabaseAtomic::assertDetachedTableNotInUse(const UUID & uuid)
@@ -679,23 +702,117 @@ bool DatabaseAtomic::canExchangeAtomically()
 }
 
 void DatabaseAtomic::exchangeMetadataFilesWithRecord(
-    DatabaseAtomic & /* other_db */,
+    DatabaseAtomic & other_db,
     const DiskPtr & disk,
     const MetadataExchangeRecord & record,
     const Strings & record_paths,
-    bool /* fsync */,
-    bool /* has_keeper_transaction */)
+    bool fsync,
+    bool has_keeper_transaction)
 {
-    /// Loading another database must not act on the records while the files move.
+    /// Loading another database must not act on the records while the files move, or while a failure of a move is handled.
     std::lock_guard exchange_lock(metadataExchangeMutex());
 
     LOG_DEBUG(log, "Exchanging {} and {} with an exchange record", record.old_path, record.new_path);
     const String tmp_path = metadataExchangeTmpPath(record.old_path);
-    disk->moveFile(record.old_path, tmp_path);
-    disk->moveFile(record.new_path, record.old_path);
-    disk->moveFile(tmp_path, record.new_path);
+    auto try_move_files = [&]() -> std::exception_ptr
+    {
+        try
+        {
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_before_first_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault before the first move of an exchange"); });
+            fiu_do_on(FailPoints::database_atomic_exchange_always_fail_before_first_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault before the first move of an exchange"); });
+            disk->moveFile(record.old_path, tmp_path);
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_after_first_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the first move of an exchange"); });
+            disk->moveFile(record.new_path, record.old_path);
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_after_second_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the second move of an exchange"); });
+            disk->moveFile(tmp_path, record.new_path);
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_after_third_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the third move of an exchange"); });
+            return nullptr;
+        }
+        catch (...)
+        {
+            /// Handled below by the state of the files.
+            return std::current_exception();
+        }
+    };
+
+    enum class Outcome : uint8_t
+    {
+        Done,
+        Retry,
+        FailCleanly,
+        Fence,
+    };
+
+    /// A move can also report an error after it succeeded, so the state of the files decides, not the error.
+    /// Once Keeper holds the exchange, rolling forward is the right direction, because a restart does the same.
+    std::exception_ptr error;
+    auto handle_error = [&](bool retried) noexcept -> Outcome
+    {
+        try
+        {
+            switch (inspectMetadataExchange(disk, record))
+            {
+                case MetadataExchangeState::Interrupted:
+                    finishMetadataExchange(disk, record, fsync);
+                    LOG_WARNING(log, "Finished the exchange of {} and {} after an error: {}",
+                        record.old_path, record.new_path, getExceptionMessage(error, false));
+                    return Outcome::Done;
+                case MetadataExchangeState::AfterExchange:
+                    LOG_WARNING(log, "The exchange of {} and {} completed despite an error: {}",
+                        record.old_path, record.new_path, getExceptionMessage(error, false));
+                    return Outcome::Done;
+                case MetadataExchangeState::BeforeExchange:
+                    if (!retried)
+                        return Outcome::Retry;
+                    /// Keeper already holds the exchange, so the files must not stay as they are.
+                    /// Without Keeper, nothing has changed and the query can fail.
+                    return has_keeper_transaction ? Outcome::Fence : Outcome::FailCleanly;
+                case MetadataExchangeState::Inconsistent:
+                    return Outcome::Fence;
+            }
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, fmt::format("Cannot finish the exchange of {} and {}", record.old_path, record.new_path));
+        }
+        return Outcome::Fence;
+    };
+
+    error = try_move_files();
+    Outcome outcome = error ? handle_error(/* retried */ false) : Outcome::Done;
+    if (outcome == Outcome::Retry)
+    {
+        /// Not the writes of the roll forward: without the temporary file, a crash between them would leave two files with the same UUID.
+        LOG_WARNING(log, "Retrying the exchange of {} and {} after an error: {}",
+            record.old_path, record.new_path, getExceptionMessage(error, false));
+        if (auto retry_error = try_move_files())
+        {
+            error = retry_error;
+            outcome = handle_error(/* retried */ true);
+        }
+        else
+        {
+            outcome = Outcome::Done;
+        }
+    }
+
+    if (outcome == Outcome::Fence)
+    {
+        /// The records stay, so that the next load finishes the exchange. Until then, DDL on both databases fails.
+        unfinished_exchange = fmt::format("{} and {}", record.old_path, record.new_path);
+        other_db.unfinished_exchange = unfinished_exchange;
+        LOG_ERROR(log, "Cannot finish the exchange of {}, DDL on the databases of both files fails until a restart", unfinished_exchange);
+        std::rethrow_exception(error);
+    }
 
     tryRemoveMetadataExchangeRecords(disk, record_paths, log);
+    if (outcome == Outcome::FailCleanly)
+        std::rethrow_exception(error);
 }
 
 LoadTaskPtr DatabaseAtomic::startupDatabaseAsync(AsyncLoader & async_loader, LoadJobSet startup_after, LoadingStrictnessLevel mode)
