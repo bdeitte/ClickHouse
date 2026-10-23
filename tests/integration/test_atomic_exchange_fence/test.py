@@ -180,7 +180,9 @@ def test_fence_refuses_move_from_ordinary(started_cluster):
     ]
     for failpoint in failpoints:
         node.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
-    error = node.query_and_get_error("EXCHANGE TABLES fence_atomic.a AND fence_atomic.b")
+    error = node.query_and_get_error(
+        "EXCHANGE TABLES fence_atomic.a AND fence_atomic.b"
+    )
     for failpoint in failpoints:
         node.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
     assert "FAULT_INJECTED" in error
