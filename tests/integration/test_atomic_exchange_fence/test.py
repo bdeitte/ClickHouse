@@ -88,8 +88,12 @@ def test_fence_until_restart(started_cluster):
     assert "`fence_db_broken_tables`" in error
     assert "UNFINISHED" in node.query_and_get_error("DROP DATABASE fence_db")
     # The fence refuses to drop or detach a table before the table is shut down,
-    # so an insert into the `ReplicatedMergeTree` table still succeeds.
-    for query in ["DROP TABLE fence_db.untouched", "DETACH TABLE fence_db.untouched"]:
+    # so an insert into the `ReplicatedMergeTree` table still succeeds. A `Replicated` database
+    # rejects a plain `DETACH TABLE` before the fence, so the detach is `PERMANENTLY`.
+    for query in [
+        "DROP TABLE fence_db.untouched",
+        "DETACH TABLE fence_db.untouched PERMANENTLY",
+    ]:
         assert "UNFINISHED" in node.query_and_get_error(
             query, settings={"distributed_ddl_output_mode": "none"}
         )
