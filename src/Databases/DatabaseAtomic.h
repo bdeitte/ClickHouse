@@ -163,6 +163,9 @@ private:
     /// so that they never see a file missing between the moves, as with an atomic exchange.
     /// It is taken after `mutex` and `metadataExchangeMutex`, so a reader must not take `mutex` while holding it:
     /// the shared lock covers only the read of the file, not `getDatabaseName`, which takes `mutex`.
+    /// `finishInterruptedMetadataExchanges` rewrites the files at load without it: it puts each file in place with `replaceFile`,
+    /// so a reader that reaches the database during `ATTACH DATABASE` never sees a file disappear. It can only see a file
+    /// that the crash left missing appear.
     mutable SharedMutex metadata_files_mutex;
 
     std::mutex exchange_probe_mutex;

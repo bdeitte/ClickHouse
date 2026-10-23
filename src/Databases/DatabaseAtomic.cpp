@@ -876,22 +876,24 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
         }
         else
         {
-            if (!tmp_exists.has_value())
+            if (tmp_exists.has_value())
+                hint = fmt::format("The temporary file {} is not left, so ", tmp_path);
+            else
                 hint = fmt::format(
                     "Cannot check whether the temporary file {} is left. If it is, the next load finishes the exchange from its record {}. "
-                    "If it is not: ",
+                    "If it is not, ",
                     tmp_path, record_path);
             if (has_keeper_transaction)
                 hint += fmt::format(
-                    "Keeper already holds the exchange, but the files do not, and the next load removes the record {} and leaves "
-                    "the files as they are. The replica is then recovered from Keeper if the database setting `check_consistency` "
-                    "is enabled, which is the default: tables that support replication are renamed to match Keeper, and other tables "
-                    "are recreated empty from Keeper, with the originals moved to the database {}, or dropped when the server setting "
+                    "the next load removes the record {} and leaves the files as they are, behind Keeper, which already holds the exchange. "
+                    "The replica is then recovered from Keeper if the database setting `check_consistency` is enabled, which is the default: "
+                    "tables that support replication are renamed to match Keeper, and other tables are recreated empty from Keeper, "
+                    "with the originals moved to the database {}, or dropped when the server setting "
                     "`database_replicated_drop_broken_tables` is enabled",
                     record_path, backQuote(database_name + DatabaseReplicated::BROKEN_TABLES_SUFFIX));
             else
                 hint += fmt::format(
-                    "The next load removes the record {} and leaves the two files as they are, "
+                    "the next load removes the record {} and leaves the two files as they are, "
                     "so compare them with the contents in the record before the restart",
                     record_path);
         }

@@ -10,7 +10,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # The readers of metadata files that do not take the database mutex, `SHOW CREATE TABLE`, `system.tables` and `BACKUP`,
 # wait for the moves, so they never see the missing file. The failpoint `database_atomic_exchange_with_record` forces
 # the record, and the test reads the metadata of the two tables while they are exchanged again and again.
-# A reader that does not wait fails only when a read falls between two moves, so a regression is found only in some runs.
+# The test is not expected to detect a missing lock in every run, because a read must fall between two moves for that.
 # Every run checks that the readers and the exchanges do not deadlock.
 
 DB="${CLICKHOUSE_DATABASE}_readers"
