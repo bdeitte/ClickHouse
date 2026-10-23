@@ -580,9 +580,9 @@ void DatabaseAtomic::assertNoUnfinishedExchangeUnlocked() const
 {
     if (!unfinished_exchange.empty())
         throw Exception(ErrorCodes::UNFINISHED,
-                        "An exchange of {} in database {} failed and could not be finished; "
-                        "restart the server, the next load finishes the exchange or reports why it cannot",
-                        unfinished_exchange, backQuote(database_name));
+                        "An exchange of {} in database {} failed and could not be finished, so DDL on the database fails "
+                        "until the server restarts. {}",
+                        unfinished_exchange, backQuote(database_name), unfinished_exchange_hint);
 }
 
 void DatabaseAtomic::assertDetachedTableNotInUse(const UUID & uuid)
@@ -833,14 +833,10 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
     if (outcome == Outcome::Fence)
     {
         /// The records stay for the next load, and until then DDL on both databases fails. The next load finishes an `Interrupted`
-        /// exchange. Without the temporary file it only removes the records: in `Replicated`, the digest check then repairs files that
-        /// are behind Keeper. With the temporary file in any other state, the load reports `CORRUPTED_DATA` and the files need manual repair.
-        unfinished_exchange = fmt::format("{} and {}", record.old_path, record.new_path);
-        other_db.unfinished_exchange = unfinished_exchange;
-        LOG_ERROR(log, "Cannot finish the exchange of {}, DDL on the databases of both files fails until the next load", unfinished_exchange);
-
-        /// The query fails, but with the temporary file left, the exchange can still take effect at the next load.
-        bool tmp_exists = false;
+        /// exchange. Without the temporary file it only removes the records: in `Replicated`, the replica recovery from Keeper then
+        /// repairs files that are behind Keeper. With the temporary file in any other state, the load reports `CORRUPTED_DATA` and
+        /// the files need manual repair. The hint tells the user which of these the restart does.
+        std::optional<bool> tmp_exists;
         try
         {
             tmp_exists = disk->existsFile(tmp_path);
@@ -849,34 +845,65 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
         {
             tryLogCurrentException(log, fmt::format("Cannot check whether {} exists", tmp_path));
         }
-        if (tmp_exists)
+
+        const String & record_path = record_paths.front();
+        String hint;
+        if (tmp_exists.has_value() && *tmp_exists)
         {
-            const String hint = fmt::format(
-                "The temporary file {} is left, so the next load finishes the exchange from its record, "
+            hint = fmt::format(
+                "The temporary file {} is left, so the next load finishes the exchange from its record {}, "
                 "or reports `CORRUPTED_DATA` if the files hold none of the recorded contents",
-                tmp_path);
-            try
-            {
-                std::rethrow_exception(error);
-            }
-            catch (Exception & e)
-            {
-                e.addMessage(hint);
-                throw;
-            }
-            catch (...)
-            {
-                /// A failed move on a local disk usually arrives as `std::filesystem::filesystem_error`, which cannot carry the hint.
-                /// The new exception keeps its code and message. The version is left out, because the final report adds it.
-                auto e = Exception::createRuntime(
-                    getCurrentExceptionCode(),
-                    getCurrentExceptionMessage(
-                        /* with_stacktrace */ false, /* check_embedded_stacktrace */ false, /* with_extra_info */ true, /* with_version */ false));
-                e.addMessage(hint);
-                throw e;
-            }
+                tmp_path, record_path);
         }
-        std::rethrow_exception(error);
+        else
+        {
+            if (!tmp_exists.has_value())
+                hint = fmt::format(
+                    "Cannot check whether the temporary file {} is left. If it is, the next load finishes the exchange from its record {}. "
+                    "If it is not: ",
+                    tmp_path, record_path);
+            if (has_keeper_transaction)
+                hint += fmt::format(
+                    "Keeper already holds the exchange, but the files do not, and the next load removes the record {} and leaves "
+                    "the files as they are. The replica is then recovered from Keeper if the database setting `check_consistency` "
+                    "is enabled, which is the default: tables that support replication are renamed to match Keeper, and other tables "
+                    "are recreated empty from Keeper, with the originals moved to the database {}, or dropped when the server setting "
+                    "`database_replicated_drop_broken_tables` is enabled",
+                    record_path, backQuote(database_name + DatabaseReplicated::BROKEN_TABLES_SUFFIX));
+            else
+                hint += fmt::format(
+                    "The next load removes the record {} and leaves the two files as they are, "
+                    "so compare them with the contents in the record before the restart",
+                    record_path);
+        }
+
+        unfinished_exchange = fmt::format("{} and {}", record.old_path, record.new_path);
+        unfinished_exchange_hint = hint;
+        other_db.unfinished_exchange = unfinished_exchange;
+        other_db.unfinished_exchange_hint = hint;
+        LOG_ERROR(log, "Cannot finish the exchange of {}, DDL on the databases of both files fails until the server restarts. {}",
+            unfinished_exchange, hint);
+
+        try
+        {
+            std::rethrow_exception(error);
+        }
+        catch (Exception & e)
+        {
+            e.addMessage(hint);
+            throw;
+        }
+        catch (...)
+        {
+            /// A failed move on a local disk usually arrives as `std::filesystem::filesystem_error`, which cannot carry the hint.
+            /// The new exception keeps its code and message. The version is left out, because the final report adds it.
+            auto e = Exception::createRuntime(
+                getCurrentExceptionCode(),
+                getCurrentExceptionMessage(
+                    /* with_stacktrace */ false, /* check_embedded_stacktrace */ false, /* with_extra_info */ true, /* with_version */ false));
+            e.addMessage(hint);
+            throw e;
+        }
     }
 
     tryRemoveMetadataExchangeRecords(disk, record_paths, log, /* found_at_load */ false);

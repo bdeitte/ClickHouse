@@ -68,6 +68,9 @@ def test_fence_until_restart(started_cluster):
         settings={"distributed_ddl_output_mode": "none"},
     )
     assert "FAULT_INJECTED" in error
+    # Without the temporary file, the restart leaves the repair to the replica recovery from Keeper,
+    # which moves exchanged tables that do not support replication to the broken-tables database.
+    assert "`fence_db_broken_tables`" in error
     node.query(
         "SYSTEM DISABLE FAILPOINT database_atomic_exchange_always_fail_before_first_move"
     )
@@ -80,7 +83,9 @@ def test_fence_until_restart(started_cluster):
     assert ".a.sql.exchange" in metadata_files("fence_db")
     # DDL on the database is fenced until a restart, and the fence refuses a detach or drop
     # before either changes anything.
-    assert "UNFINISHED" in node.query_and_get_error("DETACH DATABASE fence_db")
+    error = node.query_and_get_error("DETACH DATABASE fence_db")
+    assert "UNFINISHED" in error
+    assert "`fence_db_broken_tables`" in error
     assert "UNFINISHED" in node.query_and_get_error("DROP DATABASE fence_db")
     # The fence refuses to drop or detach a table before the table is shut down,
     # so an insert into the `ReplicatedMergeTree` table still succeeds.

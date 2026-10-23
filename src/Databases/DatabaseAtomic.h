@@ -132,7 +132,7 @@ private:
     /// Exchanges the two metadata files of `record` with three moves, instead of an atomic exchange,
     /// and removes the records at `record_paths` that `writeMetadataExchangeRecords` wrote before the Keeper commit.
     /// When a move throws, it reads the files and rolls the exchange forward from the record. When it cannot,
-    /// it keeps the records, sets `unfinished_exchange` on both databases and rethrows.
+    /// it keeps the records, sets `unfinished_exchange` and `unfinished_exchange_hint` on both databases and rethrows.
     /// `has_keeper_transaction` tells that the Keeper commit ran. The caller holds `mutex` of both databases.
     void exchangeMetadataFilesWithRecord(
         DatabaseAtomic & other_db,
@@ -146,8 +146,10 @@ private:
 
     /// Set when an exchange failed and could not be finished, so the metadata files may be half exchanged.
     /// DDL on the database fails until a restart. The next load finishes an interrupted exchange from its record,
-    /// or reports `CORRUPTED_DATA` when it cannot. In `Replicated`, the digest check repairs files that are behind Keeper.
+    /// or reports `CORRUPTED_DATA` when it cannot. In `Replicated`, the replica recovery from Keeper repairs files that are behind Keeper.
     String unfinished_exchange TSA_GUARDED_BY(mutex);
+    /// What the restart does about the unfinished exchange, for the error of DDL until then.
+    String unfinished_exchange_hint TSA_GUARDED_BY(mutex);
 
     std::mutex exchange_probe_mutex;
     std::optional<bool> exchange_is_atomic TSA_GUARDED_BY(exchange_probe_mutex);
