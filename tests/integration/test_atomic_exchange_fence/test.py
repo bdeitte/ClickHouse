@@ -101,3 +101,7 @@ def test_fence_until_restart(started_cluster):
         settings={"distributed_ddl_output_mode": "none"},
     )
     node.query("DROP DATABASE fence_db SYNC")
+    # A repair that went through the broken-tables path would leave these databases
+    # on the module-scoped cluster.
+    node.query("DROP DATABASE IF EXISTS fence_db_broken_tables SYNC")
+    node.query("DROP DATABASE IF EXISTS fence_db_broken_replicated_tables SYNC")
