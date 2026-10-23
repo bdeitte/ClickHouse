@@ -541,6 +541,9 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query, 
             tryLogCurrentException("InterpreterDropQuery", "Async loading failed", LogsLevel::warning);
     }
 
+    /// Before anything below changes the database or its tables.
+    database->checkCanBeDroppedOrDetached();
+
     getContext()->onQueryExecutionStarted();
     if (!truncate && database->hasReplicationThread())
         database->stopReplication();

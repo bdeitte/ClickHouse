@@ -80,6 +80,9 @@ public:
     /// Atomic database cannot be detached if there is detached table which still in use
     void assertCanBeDetached(bool cleanup) override;
 
+    /// Throws `UNFINISHED` while an exchange of metadata files in the database could not be finished.
+    void checkCanBeDroppedOrDetached() const override;
+
     UUID tryGetTableUUID(const String & table_name) const override;
 
     void tryCreateSymlink(const StoragePtr & table, bool if_data_path_exist = false);

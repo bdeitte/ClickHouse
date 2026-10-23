@@ -553,6 +553,12 @@ void DatabaseAtomic::commitAlterTable(const StorageID & table_id, const String &
         db_disk->replaceFile(table_metadata_tmp_path, table_metadata_path);
 }
 
+void DatabaseAtomic::checkCanBeDroppedOrDetached() const
+{
+    std::lock_guard lock{mutex};
+    assertNoUnfinishedExchangeUnlocked();
+}
+
 void DatabaseAtomic::assertNoUnfinishedExchangeUnlocked() const
 {
     if (!unfinished_exchange.empty())
@@ -813,6 +819,32 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
         unfinished_exchange = fmt::format("{} and {}", record.old_path, record.new_path);
         other_db.unfinished_exchange = unfinished_exchange;
         LOG_ERROR(log, "Cannot finish the exchange of {}, DDL on the databases of both files fails until the next load", unfinished_exchange);
+
+        /// The query fails, but with the temporary file left, the exchange can still take effect at the next load.
+        bool tmp_exists = false;
+        try
+        {
+            tmp_exists = disk->existsFile(tmp_path);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, fmt::format("Cannot check whether {} exists", tmp_path));
+        }
+        if (tmp_exists)
+        {
+            try
+            {
+                std::rethrow_exception(error);
+            }
+            catch (Exception & e)
+            {
+                e.addMessage(
+                    "The temporary file {} is left, so the next load finishes the exchange from its record, "
+                    "or reports `CORRUPTED_DATA` if the files hold none of the recorded contents",
+                    tmp_path);
+                throw;
+            }
+        }
         std::rethrow_exception(error);
     }
 
