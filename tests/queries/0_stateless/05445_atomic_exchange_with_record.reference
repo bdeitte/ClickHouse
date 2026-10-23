@@ -1,0 +1,81 @@
+Atomic
+EXCHANGE TABLES
+has y: a, d2, t.b
+dot-files: 0
+exchanged with a record
+EXCHANGE DICTIONARIES
+has y: a, d1, t.b
+dot-files: 0
+exchanged with a record
+CREATE OR REPLACE TABLE
+has y: d1, t.b
+dot-files: 0
+exchanged with a record
+4
+REPLACE TABLE
+has y: a, d1, t.b
+dot-files: 0
+exchanged with a record
+5	6
+refreshable materialized view
+has y: a, d1, t.b
+dot-files: 0
+exchanged with a record
+7
+temporary tables: 0
+EXCHANGE TABLES twice
+has y: a, d1, t.b
+dot-files: 0
+exchanged with a record
+EXCHANGE TABLES with names that need escaping
+has y: a, d1, t a
+dot-files: 0
+exchanged with a record
+EXCHANGE TABLES between databases
+default_atomic has y: d1, t a
+default_other has y: b
+dot-files: 0
+dot-files: 0
+exchanged with a record
+concurrent EXCHANGE TABLES
+has y: p1, p2
+dot-files: 0
+exchanged with a record
+
+Replicated
+EXCHANGE TABLES
+has y: a, d2, t.b
+dot-files: 0
+exchanged with a record
+EXCHANGE DICTIONARIES
+has y: a, d1, t.b
+dot-files: 0
+exchanged with a record
+CREATE OR REPLACE TABLE
+has y: d1, t.b
+dot-files: 0
+exchanged with a record
+4
+REPLACE TABLE
+has y: a, d1, t.b
+dot-files: 0
+exchanged with a record
+5	6
+refreshable materialized view
+has y: a, d1, t.b
+dot-files: 0
+exchanged with a record
+7
+temporary tables: 0
+EXCHANGE TABLES twice
+has y: a, d1, t.b
+dot-files: 0
+exchanged with a record
+EXCHANGE TABLES with names that need escaping
+has y: a, d1, t a
+dot-files: 0
+exchanged with a record
+concurrent EXCHANGE TABLES
+has y: p1, p2
+dot-files: 0
+exchanged with a record

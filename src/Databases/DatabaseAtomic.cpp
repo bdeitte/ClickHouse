@@ -24,6 +24,8 @@
 #include <Common/AsyncLoader.h>
 #include <Common/CurrentThread.h>
 #include <Common/FailPoint.h>
+#include <Common/Hex.h>
+#include <Common/thread_local_rng.h>
 #include <Interpreters/ProcessList.h>
 
 
@@ -41,6 +43,7 @@ namespace Setting
 namespace FailPoints
 {
     extern const char rename_database_after_dependency_check[];
+    extern const char database_atomic_exchange_with_record[];
 }
 
 namespace ErrorCodes
@@ -270,8 +273,9 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Moving tables between databases of different engines is not supported");
     }
 
+    /// On a local disk, an exchange the filesystem cannot do atomically is done with a record, see `canExchangeAtomically`.
     std::string message;
-    if (exchange && !supportsAtomicRename(&message))
+    if (exchange && !canEmulateExchange(getDisk()) && !supportsAtomicRename(&message))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "RENAME EXCHANGE is not supported because exchanging files is not supported by the OS ({})", message);
 
     createDirectories();
@@ -339,6 +343,18 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
     if (inside_database && table_name == to_table_name)
         return;
 
+    /// Probe after `waitDatabaseStarted`, so that loading has removed the probe files a crash left,
+    /// and before the locks of the databases, so that a probe does not hold them while it writes files.
+    bool use_record = false;
+    if (exchange && canEmulateExchange(getDisk()))
+    {
+        /// Both databases are probed, even when the first one already needs the record.
+        const bool atomic_in_this_db = canExchangeAtomically();
+        const bool atomic_in_other_db = inside_database || other_db.canExchangeAtomically();
+        use_record = !atomic_in_this_db || !atomic_in_other_db;
+        fiu_do_on(FailPoints::database_atomic_exchange_with_record, { use_record = true; });
+    }
+
     std::unique_lock<std::mutex> db_lock;
     std::unique_lock<std::mutex> other_db_lock;
     if (inside_database)
@@ -384,16 +400,47 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
     if (!inside_database && !exchange)
         other_db.checkTablesLimitUnlocked();
 
+    auto db_disk = getDisk();
+    const bool fsync = local_context->getSettingsRef()[Setting::fsync_metadata];
+
+    /// The record is in place before the commit point, so that a crash after the commit finishes the exchange at load.
+    MetadataExchangeRecord record;
+    Strings record_paths;
+    if (use_record)
+    {
+        record.old_path = old_metadata_path;
+        record.new_path = new_metadata_path;
+        record.old_path_content = readMetadataFile(db_disk, new_metadata_path);
+        record.new_path_content = readMetadataFile(db_disk, old_metadata_path);
+        std::lock_guard exchange_lock(metadataExchangeMutex());
+        record_paths = writeMetadataExchangeRecords(db_disk, record, fsync);
+    }
+
     /// Table renaming actually begins here
     auto txn = local_context->getZooKeeperMetadataTransaction();
     if (txn && !local_context->isInternalSubquery())
-        txn->commit();     /// Commit point (a sort of) for Replicated database
-
-    auto db_disk = getDisk();
+    {
+        try
+        {
+            txn->commit();     /// Commit point (a sort of) for Replicated database
+        }
+        catch (...)
+        {
+            /// Nothing has moved, so the records are not needed.
+            if (use_record)
+            {
+                std::lock_guard exchange_lock(metadataExchangeMutex());
+                tryRemoveMetadataExchangeRecords(db_disk, record_paths, log);
+            }
+            throw;
+        }
+    }
 
     /// NOTE: replica will be lost if server crashes before the following rename
     /// TODO better detection and recovery
-    if (exchange)
+    if (use_record)
+        exchangeMetadataFilesWithRecord(other_db, db_disk, record, record_paths, fsync, /* has_keeper_transaction */ txn != nullptr);
+    else if (exchange)
         db_disk->renameExchange(old_metadata_path, new_metadata_path);
     else
         db_disk->moveFile(old_metadata_path, new_metadata_path);
@@ -605,6 +652,50 @@ void DatabaseAtomic::loadTablesMetadata(ContextPtr local_context, ParsedTablesMe
 bool DatabaseAtomic::canEmulateExchange(const DiskPtr & disk)
 {
     return dynamic_cast<const DiskLocal *>(disk.get()) != nullptr;
+}
+
+bool DatabaseAtomic::canExchangeAtomically()
+{
+    std::lock_guard lock(exchange_probe_mutex);
+    if (exchange_is_atomic)
+        return *exchange_is_atomic;
+
+    auto db_disk = getDisk();
+    const String probe_path
+        = (fs::path(getMetadataPath()) / metadata_exchange_probe_prefix).string() + getHexUIntLowercase(thread_local_rng());
+    const String probe_path_1 = probe_path + "_1";
+    const String probe_path_2 = probe_path + "_2";
+    /// Loading removes the probe files a crash leaves.
+    SCOPE_EXIT({ tryRemoveMetadataExchangeRecords(db_disk, {probe_path_1, probe_path_2}, log); });
+
+    writeMetadataFile(db_disk, probe_path_1, "1", /* fsync_metadata */ false);
+    writeMetadataFile(db_disk, probe_path_2, "2", /* fsync_metadata */ false);
+    /// It returns `false` when the exchange is not supported, and throws on every other error, so an error leaves the answer unset.
+    exchange_is_atomic = db_disk->renameExchangeIfSupported(probe_path_1, probe_path_2);
+    if (!*exchange_is_atomic)
+        LOG_INFO(log, "The filesystem of {} cannot exchange two files atomically, exchanges of metadata files will use a record",
+            getMetadataPath());
+    return *exchange_is_atomic;
+}
+
+void DatabaseAtomic::exchangeMetadataFilesWithRecord(
+    DatabaseAtomic & /* other_db */,
+    const DiskPtr & disk,
+    const MetadataExchangeRecord & record,
+    const Strings & record_paths,
+    bool /* fsync */,
+    bool /* has_keeper_transaction */)
+{
+    /// Loading another database must not act on the records while the files move.
+    std::lock_guard exchange_lock(metadataExchangeMutex());
+
+    LOG_DEBUG(log, "Exchanging {} and {} with an exchange record", record.old_path, record.new_path);
+    const String tmp_path = metadataExchangeTmpPath(record.old_path);
+    disk->moveFile(record.old_path, tmp_path);
+    disk->moveFile(record.new_path, record.old_path);
+    disk->moveFile(tmp_path, record.new_path);
+
+    tryRemoveMetadataExchangeRecords(disk, record_paths, log);
 }
 
 LoadTaskPtr DatabaseAtomic::startupDatabaseAsync(AsyncLoader & async_loader, LoadJobSet startup_after, LoadingStrictnessLevel mode)

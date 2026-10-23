@@ -3,7 +3,11 @@
 #include <Databases/DatabaseMetadataDiskSettings.h>
 #include <Databases/DatabaseOrdinary.h>
 #include <Databases/DatabasesCommon.h>
+#include <Databases/MetadataExchange.h>
 #include <Storages/IStorage_fwd.h>
+
+#include <mutex>
+#include <optional>
 
 
 namespace DB
@@ -113,6 +117,24 @@ protected:
     const UUID db_uuid;
 
     LoadTaskPtr startup_atomic_database_task TSA_GUARDED_BY(mutex);
+
+private:
+    /// Whether the filesystem of the metadata directory exchanges two files atomically.
+    /// The first call checks it with two scratch files, and later calls return the cached answer.
+    bool canExchangeAtomically();
+
+    /// Exchanges the two metadata files of `record` with three moves, instead of an atomic exchange,
+    /// and removes the records at `record_paths` that `writeMetadataExchangeRecords` wrote before the Keeper commit.
+    void exchangeMetadataFilesWithRecord(
+        DatabaseAtomic & other_db,
+        const DiskPtr & disk,
+        const MetadataExchangeRecord & record,
+        const Strings & record_paths,
+        bool fsync,
+        bool has_keeper_transaction) TSA_NO_THREAD_SAFETY_ANALYSIS;
+
+    std::mutex exchange_probe_mutex;
+    std::optional<bool> exchange_is_atomic TSA_GUARDED_BY(exchange_probe_mutex);
 };
 
 }
