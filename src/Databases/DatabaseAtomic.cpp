@@ -456,7 +456,7 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
             if (use_record)
             {
                 std::lock_guard exchange_lock(metadataExchangeMutex());
-                tryRemoveMetadataExchangeRecords(db_disk, record_paths, log);
+                tryRemoveMetadataExchangeRecords(db_disk, record_paths, log, /* found_at_load */ false);
             }
             throw;
         }
@@ -709,7 +709,7 @@ bool DatabaseAtomic::canExchangeAtomically()
     const String probe_path_1 = probe_path + "_1";
     const String probe_path_2 = probe_path + "_2";
     /// Loading removes the probe files a crash leaves.
-    SCOPE_EXIT({ tryRemoveMetadataExchangeRecords(db_disk, {probe_path_1, probe_path_2}, log); });
+    SCOPE_EXIT({ tryRemoveMetadataExchangeRecords(db_disk, {probe_path_1, probe_path_2}, log, /* found_at_load */ false); });
 
     writeMetadataFile(db_disk, probe_path_1, "1", /* fsync_metadata */ false);
     writeMetadataFile(db_disk, probe_path_2, "2", /* fsync_metadata */ false);
@@ -873,7 +873,7 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
         std::rethrow_exception(error);
     }
 
-    tryRemoveMetadataExchangeRecords(disk, record_paths, log);
+    tryRemoveMetadataExchangeRecords(disk, record_paths, log, /* found_at_load */ false);
     if (outcome == Outcome::FailCleanly)
         std::rethrow_exception(error);
 }

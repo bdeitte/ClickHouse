@@ -118,7 +118,7 @@ Strings writeMetadataExchangeRecords(const DiskPtr & disk, const MetadataExchang
     return record_paths;
 }
 
-void tryRemoveMetadataExchangeRecords(const DiskPtr & disk, const Strings & record_paths, const LoggerPtr & log) noexcept
+void tryRemoveMetadataExchangeRecords(const DiskPtr & disk, const Strings & record_paths, const LoggerPtr & log, bool found_at_load) noexcept
 {
     for (const auto & path : record_paths)
     {
@@ -126,7 +126,10 @@ void tryRemoveMetadataExchangeRecords(const DiskPtr & disk, const Strings & reco
         {
             if (!disk->existsFile(path))
                 continue;
-            LOG_INFO(log, "Removing file {}", path);
+            if (found_at_load)
+                LOG_INFO(log, "Removing file {}", path);
+            else
+                LOG_DEBUG(log, "Removing file {}", path);
             disk->removeFileIfExists(path);
         }
         catch (...)
@@ -203,7 +206,7 @@ void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & met
 
     /// A record is complete before its exchange begins, so a leftover temporary record belongs to an exchange that did not begin.
     /// No probe runs while its database loads, so a probe file is a leftover of a crashed probe.
-    tryRemoveMetadataExchangeRecords(disk, leftover_paths, log);
+    tryRemoveMetadataExchangeRecords(disk, leftover_paths, log, /* found_at_load */ true);
 
     for (const auto & record_path : record_paths)
     {
@@ -223,7 +226,7 @@ void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & met
         const String primary_path = metadataExchangeRecordPath(record->old_path);
         if (record_path != primary_path && readMetadataFileIfExists(disk, primary_path) != content)
         {
-            tryRemoveMetadataExchangeRecords(disk, {record_path}, log);
+            tryRemoveMetadataExchangeRecords(disk, {record_path}, log, /* found_at_load */ true);
             continue;
         }
 
@@ -249,7 +252,7 @@ void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & met
         const String copy_path = metadataExchangeRecordPath(record->new_path);
         if (copy_path != primary_path && readMetadataFileIfExists(disk, copy_path) == content)
             finished_record_paths.push_back(copy_path);
-        tryRemoveMetadataExchangeRecords(disk, finished_record_paths, log);
+        tryRemoveMetadataExchangeRecords(disk, finished_record_paths, log, /* found_at_load */ true);
     }
 }
 
