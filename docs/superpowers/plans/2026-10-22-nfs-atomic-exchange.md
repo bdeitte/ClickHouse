@@ -138,7 +138,7 @@ tmp absent:
 ### Task 2: Probe, exchange with a record, and the gates {#task-2}
 
 Files:
-- Modify: `src/Databases/DatabaseAtomic.h`, `src/Databases/DatabaseAtomic.cpp`, `src/Interpreters/InterpreterCreateQuery.cpp`, `src/Common/FailPoint.cpp`
+- Modify: `src/Databases/DatabaseAtomic.h`, `src/Databases/DatabaseAtomic.cpp`, `src/Interpreters/InterpreterCreateQuery.cpp`, `src/Common/FailPoint.cpp`, `src/Common/atomicRename.cpp`
 - Test: `tests/queries/0_stateless/<N>_atomic_exchange_with_record.sh` and `.reference`
 
 Interfaces:
@@ -177,6 +177,8 @@ In `InterpreterCreateQuery.cpp`, change the refreshable materialized view gate t
   Expected: FAIL, because the failpoint does not exist yet (`SYSTEM ENABLE FAILPOINT` reports an unknown failpoint).
 
 - [ ] Step 3: Add the failpoint, `canEmulateExchange` use, `canExchangeAtomically`, the record write, the Keeper-commit wrapper, `exchangeMetadataFilesWithRecord` (success path only), and both gate changes
+
+  Also reword `renameExchangeFallback` in `src/Common/atomicRename.cpp` per the spec's "A clearer error for the remaining callers": include both paths and say the filesystem does not support `renameat2` with `RENAME_EXCHANGE`. No test; the only caller left is `FormatSchemaInfo`, and reaching it needs an unsupported filesystem.
 
 - [ ] Step 4: Build, restart the server, and run the test
 

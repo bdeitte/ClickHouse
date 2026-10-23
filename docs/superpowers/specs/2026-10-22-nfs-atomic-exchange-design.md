@@ -48,7 +48,7 @@ The table name in `Atomic` metadata is the file name. The file contents are `ATT
 
 - Object storage database disks. They keep master behavior, and #124937 covers them.
 - `renameNoReplace` and its racy `fs::exists` + `fs::rename` fallback. Every DDL rename runs under the database mutex, and several servers writing one metadata directory is unsupported, so the race does not affect this case. A `linkat`-based rewrite can be a later PR.
-- `FormatSchemaInfo::storeSchemaOnDisk`, the other caller of `DB::renameExchange`.
+- `FormatSchemaInfo::storeSchemaOnDisk`, the other caller of `DB::renameExchange`. It keeps failing on such filesystems, but with the clearer message below.
 - Atomicity against processes other than this server. Exchanges within one server are already serialized by the database mutex.
 - Changing which errno values count as "unsupported" in `atomicRename.cpp`.
 
@@ -120,6 +120,10 @@ For a `DiskLocal` database disk, the probe answers the question that `supportsAt
 
 On an old kernel or a platform other than Linux or macOS, `renameExchangeIfSupported` returns `false`, so a `DiskLocal` database on those systems uses the record path too. An object storage database disk on those systems still gets `NOT_IMPLEMENTED`, as on master. Removing the gate there would send it to `DiskObjectStorage::renameExchange`, which moves files in several steps without a record. Keep `supportsAtomicRename` itself.
 
+### A clearer error for the remaining callers {#clearer-error}
+
+`renameExchangeFallback` in `src/Common/atomicRename.cpp` stays reachable through `FormatSchemaInfo::storeSchemaOnDisk`, the one caller of `DB::renameExchange` outside the disks. Its message, `System call renameat2() is not supported`, blames the syscall, and issue #96835 asks at minimum for a message that points at the filesystem. Reword it to include both paths and say that the filesystem does not support `renameat2` with `RENAME_EXCHANGE`. The behavior stays fail-closed, and the errno values that count as "unsupported" do not change.
+
 ### Compatibility {#compatibility}
 
 No setting, protocol, or wire format changes. An older server ignores the dot-prefixed records. After a downgrade that follows a crash during an exchange, an older server fails to load on the leftover `<file>.tmp_exchange` with `INCORRECT_FILE_NAME`. That is the same failure master has today on object storage disks, and it is accepted.
@@ -173,3 +177,4 @@ Calls made in this document, for the user to check:
 - A seccomp profile in Docker as the manual stand-in for NFS.
 - Crash-state tests run against the server with `DETACH DATABASE` and `ATTACH DATABASE`, not with `clickhouse-local`. `Replicated` covers only the three states that agree with Keeper, built from a real exchange: after the first move, after the second move, and the record left after the third move. Each `Replicated` case waits for the digest comparison that its own attach caused, identified by a timestamp taken before the attach, before it asserts.
 - Tests pin their databases to a local disk with `SETTINGS disk`, so they run unchanged in the `db disk` CI mode.
+- From the user's external survey of other implementations (2026-10-22): reword `renameExchangeFallback` to blame the filesystem, not the syscall. The survey's other recommendations were checked and not taken: the opt-in non-atomic setting contradicts the maintainer's direction on the issue, the `linkat`-based `renameNoReplace` chain stays a later PR because the database mutex already serializes the racy fallback's callers, and broadening the "unsupported" errno set stays out of scope because kernels since 3.15 return `EINVAL` for unsupported flags per the VFS rule.
