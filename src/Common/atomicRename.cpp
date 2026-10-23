@@ -224,9 +224,15 @@ static void renameNoReplaceFallback(const std::string & old_path, const std::str
 /// Do not use [[noreturn]] to avoid warnings like "code will never be executed" in other places
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-noreturn"
-static void renameExchangeFallback(const std::string &, const std::string &)
+static void renameExchangeFallback(const std::string & old_path, const std::string & new_path)
 {
-    throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "System call renameat2() is not supported");
+    std::string message;
+    if (!supportsAtomicRename(&message))
+        throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "Cannot exchange {} and {}: an atomic exchange of them is not supported ({})",
+            old_path, new_path, message);
+    /// The OS supports the exchange, so the filesystem refused it.
+    throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
+        "Cannot exchange {} and {}: an atomic exchange of them is not supported by the filesystem", old_path, new_path);
 }
 #pragma clang diagnostic pop
 

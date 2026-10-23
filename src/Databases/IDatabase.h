@@ -553,6 +553,11 @@ public:
 
     virtual void assertCanBeDetached(bool /*cleanup*/) {}
 
+    /// Called by `DROP`, `DETACH` and `TRUNCATE DATABASE`, before replication is stopped or any table is prepared,
+    /// so that a database which refuses to detach its tables fails the query before it changes anything.
+    /// Not called by `TRUNCATE ALL TABLES`, which keeps the tables attached.
+    virtual void checkCanBeDroppedOrDetached() const {}
+
     virtual void waitDetachedTableNotInUse(const UUID & /*uuid*/, std::function<void()> /*throw_if_cancelled*/) { }
     virtual void checkDetachedTableNotInUse(const UUID & /*uuid*/) { }
 

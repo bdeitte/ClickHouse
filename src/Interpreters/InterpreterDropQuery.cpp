@@ -541,6 +541,11 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query, 
             tryLogCurrentException("InterpreterDropQuery", "Async loading failed", LogsLevel::warning);
     }
 
+    /// Before anything below changes the database or its tables.
+    /// `TRUNCATE ALL TABLES` only truncates data, so it does not need the check.
+    if (!truncate || !query.has_tables)
+        database->checkCanBeDroppedOrDetached();
+
     getContext()->onQueryExecutionStarted();
     if (!truncate && database->hasReplicationThread())
         database->stopReplication();

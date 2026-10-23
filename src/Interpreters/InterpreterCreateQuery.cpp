@@ -89,6 +89,7 @@
 #include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/hasNullable.h>
 
+#include <Databases/DatabaseAtomic.h>
 #include <Databases/DatabaseBackup.h>
 #include <Databases/DatabaseFactory.h>
 #include <Databases/DatabaseOnDisk.h>
@@ -169,6 +170,7 @@ namespace Setting
 
 namespace ServerSetting
 {
+    extern const ServerSettingsBool database_atomic_allow_exchange_emulation;
     extern const ServerSettingsBool ignore_empty_sql_security_in_create_view_query;
 }
 
@@ -2398,8 +2400,11 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
             throw Exception(ErrorCodes::INCORRECT_QUERY,
                 "Refreshable materialized views (except with APPEND) only support Atomic and Replicated database engines, but database {} has engine {}", create.getDatabase(), database->getEngineName());
 
+        /// On a local disk, a refresh exchanges the tables with a record when the filesystem cannot exchange files atomically.
+        const bool can_emulate_exchange = database && DatabaseAtomic::canEmulateExchange(database->getDisk())
+            && getContext()->getServerSettings()[ServerSetting::database_atomic_allow_exchange_emulation];
         std::string message;
-        if (!supportsAtomicRename(&message))
+        if (!can_emulate_exchange && !supportsAtomicRename(&message))
             throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                 "Can't create refreshable materialized view because exchanging files is not supported by the OS ({})", message);
     }

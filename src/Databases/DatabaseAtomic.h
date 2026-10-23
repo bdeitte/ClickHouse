@@ -3,7 +3,11 @@
 #include <Databases/DatabaseMetadataDiskSettings.h>
 #include <Databases/DatabaseOrdinary.h>
 #include <Databases/DatabasesCommon.h>
+#include <Databases/MetadataExchange.h>
 #include <Storages/IStorage_fwd.h>
+
+#include <mutex>
+#include <optional>
 
 
 namespace DB
@@ -63,12 +67,21 @@ public:
 
     void beforeLoadingMetadata(ContextMutablePtr context, LoadingStrictnessLevel mode) override;
 
+    /// Finishes the exchanges of metadata files that a crash interrupted, then loads the metadata.
+    void loadTablesMetadata(ContextPtr local_context, ParsedTablesMetadata & metadata, bool is_startup) override;
+
+    /// Whether an exchange of metadata files on `disk` can be done with three moves and a record when the disk has no atomic exchange.
+    static bool canEmulateExchange(const DiskPtr & disk);
+
     LoadTaskPtr startupDatabaseAsync(AsyncLoader & async_loader, LoadJobSet startup_after, LoadingStrictnessLevel mode) override;
     void waitDatabaseStarted() const override;
     void stopLoading() override;
 
     /// Atomic database cannot be detached if there is detached table which still in use
     void assertCanBeDetached(bool cleanup) override;
+
+    /// Throws `UNFINISHED` while an exchange of metadata files in the database could not be finished.
+    void checkCanBeDroppedOrDetached() const override;
 
     UUID tryGetTableUUID(const String & table_name) const override;
 
@@ -107,6 +120,34 @@ protected:
     const UUID db_uuid;
 
     LoadTaskPtr startup_atomic_database_task TSA_GUARDED_BY(mutex);
+
+private:
+    /// Whether the filesystem of the metadata directory exchanges two files atomically.
+    /// The first call checks it with two scratch files, and later calls return the cached answer.
+    bool canExchangeAtomically();
+
+    /// Exchanges the two metadata files of `record` with three moves, instead of an atomic exchange,
+    /// and removes the records at `record_paths` that `writeMetadataExchangeRecords` wrote before the Keeper commit.
+    /// When a move throws, it reads the files and rolls the exchange forward from the record. When it cannot,
+    /// it keeps the records, sets `unfinished_exchange` on both databases and rethrows.
+    /// `has_keeper_transaction` tells that the Keeper commit ran. The caller holds `mutex` of both databases.
+    void exchangeMetadataFilesWithRecord(
+        DatabaseAtomic & other_db,
+        const DiskPtr & disk,
+        const MetadataExchangeRecord & record,
+        const Strings & record_paths,
+        bool fsync,
+        bool has_keeper_transaction) TSA_NO_THREAD_SAFETY_ANALYSIS;
+
+    void assertNoUnfinishedExchangeUnlocked() const TSA_REQUIRES(mutex);
+
+    /// Set when an exchange failed and could not be finished, so the metadata files may be half exchanged.
+    /// DDL on the database fails until a restart. The next load finishes an interrupted exchange from its record,
+    /// or reports `CORRUPTED_DATA` when it cannot. In `Replicated`, the digest check repairs files that are behind Keeper.
+    String unfinished_exchange TSA_GUARDED_BY(mutex);
+
+    std::mutex exchange_probe_mutex;
+    std::optional<bool> exchange_is_atomic TSA_GUARDED_BY(exchange_probe_mutex);
 };
 
 }

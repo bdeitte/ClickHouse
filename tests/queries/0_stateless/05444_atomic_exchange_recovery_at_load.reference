@@ -1,0 +1,30 @@
+case 1: the record only, before the exchange
+not exchanged
+
+case 2: after the first move
+exchanged
+
+case 3: after the second move
+exchanged
+
+case 4: after the third move
+exchanged
+
+case 5: a leftover temporary record and a leftover probe file
+not exchanged
+
+case 6: the record only, and a metadata file that changed after it
+not exchanged
+
+case 7: the temporary file, and a metadata file with neither of the recorded contents
+CORRUPTED_DATA
+.a.sql.exchange
+the temporary file is left
+
+case 8: an exchange between two databases, the database with the copy of the record attached first
+exchanged
+
+case 9: a stale copy of a record, whose primary a newer exchange overwrote
+a and c exchanged
+b unchanged
+
