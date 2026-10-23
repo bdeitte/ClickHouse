@@ -1,0 +1,97 @@
+import pytest
+
+from helpers.cluster import ClickHouseCluster
+from helpers.test_tools import assert_eq_with_retry
+
+# When an exchange of metadata files with a record fails after the Keeper commit and cannot be rolled
+# forward from the record, the database fences its DDL until a restart. This needs a restart to recover,
+# so a stateless test cannot cover it. The failpoint `database_atomic_exchange_with_record` forces the
+# record path, and `database_atomic_exchange_always_fail_before_first_move` fails the moves and the retry.
+
+cluster = ClickHouseCluster(__file__)
+
+node = cluster.add_instance("node", with_zookeeper=True, stay_alive=True)
+
+
+@pytest.fixture(scope="module")
+def started_cluster():
+    try:
+        cluster.start()
+        yield cluster
+    finally:
+        cluster.shutdown()
+
+
+def metadata_files(database):
+    rel = node.query(
+        f"SELECT metadata_path FROM system.databases WHERE name = '{database}'"
+    ).strip()
+    return node.exec_in_container(
+        ["bash", "-c", f"ls -A /var/lib/clickhouse/{rel}"]
+    ).split()
+
+
+def has_column(database, table, column):
+    return node.query(
+        f"SELECT count() FROM system.columns"
+        f" WHERE database = '{database}' AND table = '{table}' AND name = '{column}'"
+    ).strip()
+
+
+def test_fence_until_restart(started_cluster):
+    node.query(
+        "CREATE DATABASE fence_db"
+        " ENGINE = Replicated('/clickhouse/databases/fence_db', 'shard1', 'replica1')"
+    )
+    node.query("CREATE TABLE fence_db.a (x UInt8) ENGINE = MergeTree ORDER BY x")
+    node.query(
+        "CREATE TABLE fence_db.b (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x"
+    )
+    node.query("INSERT INTO fence_db.b VALUES (1, 2)")
+
+    node.query("SYSTEM ENABLE FAILPOINT database_atomic_exchange_with_record")
+    node.query(
+        "SYSTEM ENABLE FAILPOINT database_atomic_exchange_always_fail_before_first_move"
+    )
+    error = node.query_and_get_error(
+        "EXCHANGE TABLES fence_db.a AND fence_db.b",
+        settings={"distributed_ddl_output_mode": "none"},
+    )
+    assert "FAULT_INJECTED" in error
+    node.query(
+        "SYSTEM DISABLE FAILPOINT database_atomic_exchange_always_fail_before_first_move"
+    )
+    node.query("SYSTEM DISABLE FAILPOINT database_atomic_exchange_with_record")
+
+    # Keeper holds the exchange, while the local files and tables do not.
+    assert has_column("fence_db", "a", "y") == "0"
+    # Reads still work, and the record of the fenced exchange is kept for the next load.
+    assert node.query("SELECT count() FROM fence_db.b").strip() == "1"
+    assert ".a.sql.exchange" in metadata_files("fence_db")
+    # DDL on the database is fenced until a restart, and the fence refuses a detach or drop
+    # before either changes anything.
+    assert "UNFINISHED" in node.query_and_get_error("DETACH DATABASE fence_db")
+    assert "UNFINISHED" in node.query_and_get_error("DROP DATABASE fence_db")
+
+    node.restart_clickhouse()
+
+    # The load removes the record, and the digest check on the DDL worker repairs the files,
+    # which are behind Keeper, so the exchange takes effect.
+    assert_eq_with_retry(
+        node,
+        "SELECT count() FROM system.columns"
+        " WHERE database = 'fence_db' AND table = 'a' AND name = 'y'",
+        "1",
+        retry_count=60,
+    )
+    assert has_column("fence_db", "b", "y") == "0"
+    assert node.query("SELECT count() FROM fence_db.a").strip() == "1"
+    files = metadata_files("fence_db")
+    assert not any(name.startswith(".") for name in files)
+    assert not any(name.endswith(".tmp_exchange") for name in files)
+    # The fence is gone.
+    node.query(
+        "CREATE TABLE fence_db.c (x UInt8) ENGINE = MergeTree ORDER BY x",
+        settings={"distributed_ddl_output_mode": "none"},
+    )
+    node.query("DROP DATABASE fence_db SYNC")
