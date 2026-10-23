@@ -55,6 +55,7 @@ namespace FailPoints
     extern const char database_atomic_exchange_fail_after_second_move[];
     extern const char database_atomic_exchange_fail_after_third_move[];
     extern const char database_atomic_exchange_always_fail_before_first_move[];
+    extern const char database_atomic_exchange_fail_to_finish[];
 }
 
 namespace ErrorCodes
@@ -576,6 +577,12 @@ void DatabaseAtomic::checkTablesCanBeDroppedOrDetached() const
     assertNoUnfinishedExchangeUnlocked();
 }
 
+void DatabaseAtomic::checkTablesCanBeCreated() const
+{
+    std::lock_guard lock{mutex};
+    assertNoUnfinishedExchangeUnlocked();
+}
+
 ASTPtr DatabaseAtomic::readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const
 {
     std::shared_lock lock(metadata_files_mutex);
@@ -806,6 +813,8 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
             switch (inspectMetadataExchange(disk, record))
             {
                 case MetadataExchangeState::Interrupted:
+                    fiu_do_on(FailPoints::database_atomic_exchange_fail_to_finish,
+                        { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault before finishing an exchange"); });
                     finishMetadataExchange(disk, record, fsync);
                     LOG_WARNING(log, "Finished the exchange of {} and {} after an error: {}",
                         record.old_path, record.new_path, getExceptionMessage(error, false));
