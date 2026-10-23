@@ -32,7 +32,8 @@ Spec: `docs/superpowers/specs/2026-10-22-nfs-atomic-exchange-design.md`. Read it
 - Server for tests: after each build, stop any running dev server and start a new one in the background with `cd programs/server && ../../build/programs/clickhouse server > ../../build/server.log 2>&1`.
 - Tests: `tests/clickhouse-test <name> > build/test_<name>.log 2>&1`. Have a subagent read the log and return a short summary.
 - Create each new test with `./tests/queries/0_stateless/add-test <name>.sh`. Tests below are referred to by name without the number prefix.
-- Every test database is created with `SETTINGS disk = 'default'`, so its metadata stays on `DiskLocal` in the `db disk` CI mode.
+- No test database uses `SETTINGS disk`: `Replicated` rejects it with `UNKNOWN_SETTING`. In the `db disk` CI mode every database's metadata is on an S3 `plain_rewritable` disk, where `canEmulateExchange` is false and the record path cannot run, so the tests would be vacuous there. Every new test therefore starts with a guard: join the `path` of disk `default` from `system.disks` with the `metadata_path` of the test's own database from `system.databases`, and when that directory does not exist on the local filesystem, print the test's own `.reference` file and exit 0.
+- `metadata_path` in `system.databases` is already relative to the database disk (`store/<xxx>/<uuid>/`). Use it as-is for paths inside records, and join the `default` disk's `path` with it for reading and writing files from the shell.
 
 ## Review focus {#review-focus}
 
@@ -98,9 +99,9 @@ tmp absent:
 - [ ] Step 1: Write the failing test `atomic_exchange_recovery_at_load.sh`
 
   The test needs no failpoint and no `no-parallel` tag. Setup:
-  - Create database `${CLICKHOUSE_DATABASE}_r ENGINE = Atomic SETTINGS disk = 'default'`.
+  - Create database `${CLICKHOUSE_DATABASE}_r ENGINE = Atomic`.
   - Create tables `a (x UInt8)` and `b (x UInt8, y UInt8)` as `MergeTree ORDER BY x`, and insert one row into each.
-  - Read `metadata_path` from `system.databases` before any `DETACH`. Derive disk-relative paths by stripping the `path` of disk `default` from `system.disks`. Save the contents of `a.sql` (`A`) and `b.sql` (`B`).
+  - Read `metadata_path` from `system.databases` before any `DETACH`. It is already relative to the disk, so record paths use it unchanged. The absolute directory for reading and writing files is the `path` of disk `default` from `system.disks` joined with `metadata_path`. Save the contents of `a.sql` (`A`) and `b.sql` (`B`).
   - Build records with `clickhouse-local` as `SELECT arrayJoin(['exchange v1', old_path, new_path, old_content, new_content]) FORMAT TSV`. TSV escaping is the same as `writeEscapedString`.
 
   Each case runs `DETACH DATABASE`, writes files, runs `ATTACH DATABASE`, and then prints three things: `exchanged` or `not exchanged` (from whether `system.columns` shows `y` in table `a`), a sorted list of the dot-files left in the directory, and an empty line. The baseline is restored before the next case. Cases and expected results:
@@ -159,7 +160,7 @@ In `InterpreterCreateQuery.cpp`, change the refreshable materialized view gate t
 
 - [ ] Step 1: Write the failing test `atomic_exchange_with_record.sh`
 
-  Tags: `zookeeper, no-parallel`, because failpoints are server-wide and would change other tests' exchanges. The test enables `database_atomic_exchange_with_record` at the start and disables it in a `trap` on exit. It runs everything below in an `Atomic` database and in a `Replicated` database, both with `SETTINGS disk = 'default'`. The `Replicated` path is under `/test/$CLICKHOUSE_TEST_ZOOKEEPER_PREFIX/`.
+  Tags: `zookeeper, no-parallel`, because failpoints are server-wide and would change other tests' exchanges. The test enables `database_atomic_exchange_with_record` at the start and disables it in a `trap` on exit. It runs everything below in an `Atomic` database and in a `Replicated` database. The `Replicated` path is under `/test/$CLICKHOUSE_TEST_ZOOKEEPER_PREFIX/`.
 
   After each statement it prints which table has column `y`, prints the count of dot-files in the metadata directory (expected `0`), and checks that `system.text_log` has at least one new `Exchanging ... with an exchange record` line for the database. Statements:
   - `EXCHANGE TABLES a AND b`.
@@ -178,7 +179,7 @@ In `InterpreterCreateQuery.cpp`, change the refreshable materialized view gate t
 
 - [ ] Step 3: Add the failpoint, `canEmulateExchange` use, `canExchangeAtomically`, the record write, the Keeper-commit wrapper, `exchangeMetadataFilesWithRecord` (success path only), and both gate changes
 
-  Also reword `renameExchangeFallback` in `src/Common/atomicRename.cpp` per the spec's "A clearer error for the remaining callers": include both paths and say the filesystem does not support `renameat2` with `RENAME_EXCHANGE`. No test; the only caller left is `FormatSchemaInfo`, and reaching it needs an unsupported filesystem.
+  Also reword `renameExchangeFallback` in `src/Common/atomicRename.cpp` per the spec's "A clearer error for the remaining callers": include both paths and say an atomic exchange of them is not supported, appending the reason from `supportsAtomicRename(&message)` when it returns false and attributing it to the filesystem otherwise. No test; the only caller left is `FormatSchemaInfo`, and reaching it needs an unsupported filesystem.
 
 - [ ] Step 4: Build, restart the server, and run the test
 
@@ -246,7 +247,7 @@ Interfaces:
 - [ ] Step 1: Write the test `replicated_exchange_recovery_at_load.sh`
 
   Tags: `zookeeper, no-parallel`. The steps follow the spec's `Replicated` bullets:
-  - Create the `Replicated` database with `SETTINGS disk = 'default'` and tables `a` and `b`. Read `metadata_path`.
+  - Create the `Replicated` database and tables `a` and `b`. Read `metadata_path`.
   - Run a real `EXCHANGE TABLES a AND b` with `database_atomic_exchange_with_record` enabled, then disable it. Save the post-exchange contents of `a.sql` (`B`) and `b.sql` (`A`).
   - For each state, run `DETACH DATABASE` and write the state:
     - after the first move: `a.sql` absent, temporary file holding `A`, `b.sql` holding `B`;
