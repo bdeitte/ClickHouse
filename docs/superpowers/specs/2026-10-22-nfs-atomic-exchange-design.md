@@ -73,7 +73,8 @@ The table name in `Atomic` metadata is the file name. The file contents are `ATT
 Decided: a probe, not "try the syscall first and fall back". Trying first would put the record after the Keeper commit.
 
 - The probe runs per database, in the database's metadata directory, the first time that database performs an exchange. It runs before `renameTable` takes the database mutexes. The answer is cached for the lifetime of the database object. A per-database probe is more precise than a per-disk one because a metadata directory can be on a different mount from the disk root.
-- The probe creates two small dot-prefixed scratch files in the metadata directory, calls `IDisk::renameExchangeIfSupported` on them, and removes them. It removes leftovers from an earlier crashed probe first. `DatabaseOnDisk::iterateMetadataFiles` skips dot-prefixed names on every disk, so a leftover never breaks loading.
+- Two exchanges in one database can start at the same time, for example two refreshable materialized views refreshing after startup. So the probe runs at most once per database, under a lock that concurrent callers wait on. If the probe throws, the answer stays unset and the next exchange probes again.
+- The probe creates two small dot-prefixed scratch files with unique names in the metadata directory, calls `IDisk::renameExchangeIfSupported` on them, and removes them. The probe never removes other files. Leftovers from a crashed probe are removed by pattern in `finishInterruptedExchanges` at load, when no probe can be running. `DatabaseOnDisk::iterateMetadataFiles` skips dot-prefixed names on every disk, so a leftover never breaks loading.
 - `renameExchangeIfSupported` already returns `false` for "unsupported" and throws for every other error. The probe lets those errors propagate.
 - The probe runs only when the database disk is a `DiskLocal`. Other disks keep master behavior.
 - For an exchange between two databases, both databases are probed. The record path is used if either one reports "unsupported".
@@ -84,7 +85,7 @@ Decided: a probe, not "try the syscall first and fall back". Trying first would 
 When the probe reports "unsupported", `renameTable` performs these steps in place of `db_disk->renameExchange`:
 
 1. Before the Keeper commit, it writes the record `.<file>.exchange` next to `old_path`, plus a copy next to `new_path` when the two databases' directories differ. The format is #124937's: the header line `exchange v1`, then `old_path`, `new_path`, and the contents each path will have after the exchange, each escaped and on its own line. Each record is written as `<record>.tmp` and then put in place with `replaceFile`.
-2. The existing Keeper commit runs.
+2. The existing Keeper commit runs. If it throws, nothing has moved, so remove the records and rethrow.
 3. Three moves follow through `db_disk->moveFile`: `old_path` to `old_path + ".tmp_exchange"`, `new_path` to `old_path`, and the temporary file to `new_path`.
 4. The records are removed. This step is best effort. A record without its temporary file is harmless and gets removed at the next load.
 
@@ -99,11 +100,12 @@ This is where the design differs from #124937, which undoes the moves. After the
 
 ### Finishing an exchange at load {#recovery-at-load}
 
-`DatabaseAtomic` overrides `loadTablesMetadata` to run `finishInterruptedExchanges` before `DatabaseOrdinary::loadTablesMetadata`, as #124937 does. The rules are the same as theirs:
+`DatabaseAtomic` overrides `loadTablesMetadata` to run `finishInterruptedExchanges` before `DatabaseOrdinary::loadTablesMetadata`, as #124937 does. The rules follow theirs, plus one extra check on the temporary file:
 
-- A leftover `<record>.tmp` belongs to an exchange that never began. Remove it.
-- For each record, if the temporary file exists, check that each of `old_path` and `new_path` is either absent or holds one of the two recorded contents. If one holds neither, throw `CORRUPTED_DATA`. Otherwise write both recorded contents, remove the temporary file, and log the warning `Finished the interrupted exchange of ...`.
-- Remove the record and its copy.
+- A leftover `<record>.tmp` belongs to an exchange that never began. Remove it. Also remove leftover probe files.
+- The record next to `old_path` is the primary, and the record next to `new_path` is a copy. A newer exchange with the same `old_path` overwrites the primary. So act on a copy only while the primary exists and has the same content. Otherwise the copy is stale: remove it and do nothing else.
+- For each record that passes, if the temporary file `old_path + ".tmp_exchange"` exists, check that it holds the content recorded for `new_path`. Also check that each of `old_path` and `new_path` is either absent or holds one of the two recorded contents. If any check fails, throw `CORRUPTED_DATA` and leave the files as they are. Otherwise write both recorded contents, remove the temporary file, and log the warning `Finished the interrupted exchange of ...`.
+- Remove the primary record, and the copy if its content matches the primary.
 
 With `async_load_databases = true`, the two databases of a cross-database exchange can load at the same time. The AI review on #124937 found that their version races in that case. Serialize the recovery with a process-wide mutex, and make each step tolerate a record or temporary file that the other database's recovery already removed.
 
@@ -111,12 +113,12 @@ The rules for a failure during the moves and for recovery at load share their lo
 
 ### Removing the kernel-version gates {#remove-gates}
 
-The probe answers the question that `supportsAtomicRename` approximates. Remove these two checks:
+For a `DiskLocal` database disk, the probe answers the question that `supportsAtomicRename` approximates. Skip these two checks when the database disk is a `DiskLocal`, and keep them for every other disk:
 
 - The `NOT_IMPLEMENTED` throw for `exchange` in `DatabaseAtomic::renameTable`.
 - The `NOT_IMPLEMENTED` throw for refreshable materialized views in `InterpreterCreateQuery` (search for "Can't create refreshable materialized view because exchanging files is not supported").
 
-On an old kernel or a platform other than Linux or macOS, `renameExchangeIfSupported` returns `false`, so those systems use the record path too. Keep `supportsAtomicRename` itself.
+On an old kernel or a platform other than Linux or macOS, `renameExchangeIfSupported` returns `false`, so a `DiskLocal` database on those systems uses the record path too. An object storage database disk on those systems still gets `NOT_IMPLEMENTED`, as on master. Removing the gate there would send it to `DiskObjectStorage::renameExchange`, which moves files in several steps without a record. Keep `supportsAtomicRename` itself.
 
 ### Compatibility {#compatibility}
 
@@ -130,7 +132,8 @@ There is no real NFS or EFS mount available. Verification relies on failpoints a
 - Stateless `.sh` tests, created with `tests/queries/0_stateless/add-test`, with the probe failpoint enabled:
   - Each statement in the intent works and leaves no record behind. Run them in an `Atomic` database, in a `Replicated` database, and across two databases.
   - Each move failpoint leaves the query successful with the tables exchanged.
-  - Each crash state recovers on `DETACH DATABASE` and `ATTACH DATABASE`: record only, record with the temporary file after each move, a leftover `<record>.tmp`, and a file matching neither content. Build the states by hand as files, using #124937's `05340` test as the model.
+  - Each crash state recovers on `DETACH DATABASE` and `ATTACH DATABASE`: record only, record with the temporary file after each move, a leftover `<record>.tmp`, a leftover probe file, a stale copy whose primary a newer exchange overwrote, and a file matching neither content.
+  - Two exchanges that start at the same time in a fresh database both succeed, which covers the probe lock. Build the states by hand as files, using #124937's `05340` test as the model.
 - These tests run on the native macOS build, because the failpoint forces the emulated path. APFS supports the exchange natively, so the path never runs there without the failpoint.
 - A manual check before the PR leaves draft: run a CI-built Linux binary in Docker on the Mac with a seccomp profile that returns `EINVAL` for `renameat2` with any non-zero flags, which reproduces NFS behavior for both `RENAME_EXCHANGE` and `RENAME_NOREPLACE`. In that container, run the statements, then a `kill -9` loop during `EXCHANGE TABLES` with a restart after each kill, and confirm that every restart succeeds. Also try a Docker Desktop bind mount to see whether #83524 is fixed.
 
@@ -156,11 +159,12 @@ Decided by the user:
 - Verify without a real NFS mount.
 
 Calls made in this document, for the user to check:
-- Probe per database in its metadata directory, lazily, cached for the life of the database object.
-- Only `DiskLocal`. Object storage stays as on master.
+- Probe per database in its metadata directory, lazily, at most once under a lock, cached for the life of the database object.
+- Only `DiskLocal`. Object storage stays as on master, including the kernel-version gates.
 - Roll forward on a failed move, instead of #124937's undo. The fence remains only for a failed roll forward.
 - No new setting.
-- Remove the two kernel-version gates.
+- Skip the two kernel-version gates for `DiskLocal` database disks only.
+- Recovery checks the temporary file's content, in addition to #124937's checks.
 - `renameNoReplace`, `FormatSchemaInfo`, and errno changes are out of scope.
 - Process-wide mutex for recovery at load.
 - A seccomp profile in Docker as the manual stand-in for NFS.
