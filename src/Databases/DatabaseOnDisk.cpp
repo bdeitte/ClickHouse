@@ -1006,6 +1006,11 @@ ASTPtr DatabaseOnDisk::readCreateQueryFromMetadataFile(const String & table_name
     return parseQueryFromMetadata(log, getContext(), getDisk(), getObjectMetadataPath(table_name), throw_on_error);
 }
 
+String DatabaseOnDisk::readObjectMetadataFile(const String & object_name) const
+{
+    return readMetadataFile(getDisk(), getObjectMetadataPath(object_name));
+}
+
 ASTPtr DatabaseOnDisk::getCreateQueryFromMetadata(const String & table_name, bool throw_on_error) const
 {
     ASTPtr ast = readCreateQueryFromMetadataFile(table_name, throw_on_error);

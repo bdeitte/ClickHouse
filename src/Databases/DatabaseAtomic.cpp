@@ -589,6 +589,12 @@ ASTPtr DatabaseAtomic::readCreateQueryFromMetadataFile(const String & table_name
     return DatabaseOrdinary::readCreateQueryFromMetadataFile(table_name, throw_on_error);
 }
 
+String DatabaseAtomic::readObjectMetadataFile(const String & object_name) const
+{
+    std::shared_lock lock(metadata_files_mutex);
+    return DatabaseOrdinary::readObjectMetadataFile(object_name);
+}
+
 time_t DatabaseAtomic::getObjectMetadataModificationTime(const String & object_name) const
 {
     std::shared_lock lock(metadata_files_mutex);
