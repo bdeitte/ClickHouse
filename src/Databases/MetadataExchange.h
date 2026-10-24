@@ -26,6 +26,9 @@ struct MetadataExchangeRecord
 };
 
 /// Held both by the loader in `finishInterruptedMetadataExchanges` and by the exchange writer, so that neither sees the other's records half done.
+/// It is one mutex for the whole server, held across the moves of an exchange and the handling of their failure, so a move that hangs
+/// on the filesystem blocks every other exchange with a record and every load that finds records. Such exchanges are rare,
+/// and loads find records only after a crash or an exchange that could not be finished, so one mutex is kept simple on purpose.
 std::mutex & metadataExchangeMutex();
 
 /// `dir/a.sql` -> `dir/.a.sql.exchange`: listings of metadata directories skip names starting with a dot.
@@ -67,10 +70,10 @@ enum class MetadataExchangeState : uint8_t
 
 MetadataExchangeState inspectMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record);
 
-/// Writes both recorded contents through `.tmp` files and `replaceFile`, then removes the temporary file.
+/// Writes each recorded content to `dir/.<file>.exchange_write` and puts it in place with `replaceFile`, then removes the temporary file.
 void finishMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync);
 
-/// Called when a database on `disk` is loaded. Removes leftover temporary records and probe files in `metadata_dir`,
+/// Called when a database on `disk` is loaded. Removes leftover temporary records, writes of a finish and probe files in `metadata_dir`,
 /// finishes the interrupted exchanges recorded there, and removes their records.
 /// Throws `CORRUPTED_DATA` and leaves the files as they are when an exchange cannot be finished safely.
 void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & metadata_dir, bool fsync, const LoggerPtr & log);

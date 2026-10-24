@@ -28,3 +28,6 @@ case 9: a stale copy of a record, whose primary a newer exchange overwrote
 a and c exchanged
 b unchanged
 
+case 10: a finish that a crash interrupted after the first move, with its write left
+exchanged
+
