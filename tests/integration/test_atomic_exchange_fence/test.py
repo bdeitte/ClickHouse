@@ -188,6 +188,15 @@ def test_fence_refuses_move_from_ordinary(started_cluster):
     )
     node.query("CREATE TABLE fence_ordinary.t (x UInt8) ENGINE = MergeTree ORDER BY x")
     node.query("INSERT INTO fence_ordinary.t VALUES (1)")
+    # An `ALTER` through an alias in another database reaches the `ReplicatedMergeTree` table without
+    # the check of `InterpreterAlterQuery`, which checks only the database of the alias.
+    node.query(
+        "CREATE TABLE fence_atomic.r (x UInt8)"
+        " ENGINE = ReplicatedMergeTree('/clickhouse/tables/fence_atomic_r', 'r1') ORDER BY x"
+    )
+    node.query(
+        "CREATE TABLE fence_ordinary.r_alias ENGINE = Alias('fence_atomic', 'r')"
+    )
 
     failpoints = [
         "database_atomic_exchange_with_record",
@@ -210,16 +219,28 @@ def test_fence_refuses_move_from_ordinary(started_cluster):
         "RENAME TABLE fence_ordinary.t TO fence_atomic.t"
     )
     assert node.query("SELECT count() FROM fence_ordinary.t").strip() == "1"
+    # The `ReplicatedMergeTree` table refuses the `ALTER` before it commits the change to Keeper.
+    assert "UNFINISHED" in node.query_and_get_error(
+        "ALTER TABLE fence_ordinary.r_alias ADD COLUMN z UInt8"
+    )
+    keeper_columns = node.query(
+        "SELECT value FROM system.zookeeper"
+        " WHERE path = '/clickhouse/tables/fence_atomic_r' AND name = 'columns'"
+    )
+    assert "`x` UInt8" in keeper_columns
+    assert "`z`" not in keeper_columns
 
     node.restart_clickhouse()
 
     # The load finishes the exchange from its record, and the fence is gone.
     assert has_column("fence_atomic", "a", "y") == "1"
     assert has_column("fence_atomic", "b", "y") == "0"
+    assert has_column("fence_atomic", "r", "z") == "0"
     files = metadata_files("fence_atomic")
     assert not any(name.startswith(".") for name in files)
     assert not any(name.endswith(".tmp_exchange") for name in files)
     node.query("RENAME TABLE fence_ordinary.t TO fence_atomic.t")
     assert node.query("SELECT count() FROM fence_atomic.t").strip() == "1"
+    node.query("DROP TABLE fence_ordinary.r_alias SYNC")
     node.query("DROP DATABASE fence_atomic SYNC")
     node.query("DROP DATABASE fence_ordinary SYNC")
