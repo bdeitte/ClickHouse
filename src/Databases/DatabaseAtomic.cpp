@@ -55,6 +55,7 @@ namespace FailPoints
     extern const char database_atomic_exchange_fail_after_second_move[];
     extern const char database_atomic_exchange_fail_after_third_move[];
     extern const char database_atomic_exchange_always_fail_before_first_move[];
+    extern const char database_atomic_exchange_fail_to_finish[];
 }
 
 namespace ErrorCodes
@@ -456,7 +457,7 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
             if (use_record)
             {
                 std::lock_guard exchange_lock(metadataExchangeMutex());
-                tryRemoveMetadataExchangeRecords(db_disk, record_paths, log);
+                tryRemoveMetadataExchangeRecords(db_disk, record_paths, log, /* found_at_load */ false);
             }
             throw;
         }
@@ -570,13 +571,37 @@ void DatabaseAtomic::checkCanBeDroppedOrDetached() const
     assertNoUnfinishedExchangeUnlocked();
 }
 
+void DatabaseAtomic::checkTablesCanBeDroppedOrDetached() const
+{
+    std::lock_guard lock{mutex};
+    assertNoUnfinishedExchangeUnlocked();
+}
+
+void DatabaseAtomic::checkTablesCanBeCreated() const
+{
+    std::lock_guard lock{mutex};
+    assertNoUnfinishedExchangeUnlocked();
+}
+
+ASTPtr DatabaseAtomic::readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const
+{
+    std::shared_lock lock(metadata_files_mutex);
+    return DatabaseOrdinary::readCreateQueryFromMetadataFile(table_name, throw_on_error);
+}
+
+time_t DatabaseAtomic::getObjectMetadataModificationTime(const String & object_name) const
+{
+    std::shared_lock lock(metadata_files_mutex);
+    return DatabaseOrdinary::getObjectMetadataModificationTime(object_name);
+}
+
 void DatabaseAtomic::assertNoUnfinishedExchangeUnlocked() const
 {
     if (!unfinished_exchange.empty())
         throw Exception(ErrorCodes::UNFINISHED,
-                        "An exchange of {} in database {} failed and could not be finished; "
-                        "restart the server, the next load finishes the exchange or reports why it cannot",
-                        unfinished_exchange, backQuote(database_name));
+                        "An exchange of {} in database {} failed and could not be finished, so DDL on the database fails "
+                        "until the server restarts. {}",
+                        unfinished_exchange, backQuote(database_name), unfinished_exchange_hint);
 }
 
 void DatabaseAtomic::assertDetachedTableNotInUse(const UUID & uuid)
@@ -709,7 +734,7 @@ bool DatabaseAtomic::canExchangeAtomically()
     const String probe_path_1 = probe_path + "_1";
     const String probe_path_2 = probe_path + "_2";
     /// Loading removes the probe files a crash leaves.
-    SCOPE_EXIT({ tryRemoveMetadataExchangeRecords(db_disk, {probe_path_1, probe_path_2}, log); });
+    SCOPE_EXIT({ tryRemoveMetadataExchangeRecords(db_disk, {probe_path_1, probe_path_2}, log, /* found_at_load */ false); });
 
     writeMetadataFile(db_disk, probe_path_1, "1", /* fsync_metadata */ false);
     writeMetadataFile(db_disk, probe_path_2, "2", /* fsync_metadata */ false);
@@ -731,6 +756,13 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
 {
     /// Loading another database must not act on the records while the files move, or while a failure of a move is handled.
     std::lock_guard exchange_lock(metadataExchangeMutex());
+
+    /// Readers of the metadata files wait until the moves and the handling of their failure are over.
+    /// Every exclusive holder of `metadata_files_mutex` holds `metadataExchangeMutex`, so the two locks cannot deadlock.
+    std::unique_lock files_lock(metadata_files_mutex);
+    std::unique_lock<SharedMutex> other_files_lock;
+    if (&other_db != this)
+        other_files_lock = std::unique_lock(other_db.metadata_files_mutex);
 
     LOG_DEBUG(log, "Exchanging {} and {} with an exchange record", record.old_path, record.new_path);
     const String tmp_path = metadataExchangeTmpPath(record.old_path);
@@ -781,6 +813,8 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
             switch (inspectMetadataExchange(disk, record))
             {
                 case MetadataExchangeState::Interrupted:
+                    fiu_do_on(FailPoints::database_atomic_exchange_fail_to_finish,
+                        { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault before finishing an exchange"); });
                     finishMetadataExchange(disk, record, fsync);
                     LOG_WARNING(log, "Finished the exchange of {} and {} after an error: {}",
                         record.old_path, record.new_path, getExceptionMessage(error, false));
@@ -827,14 +861,10 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
     if (outcome == Outcome::Fence)
     {
         /// The records stay for the next load, and until then DDL on both databases fails. The next load finishes an `Interrupted`
-        /// exchange. Without the temporary file it only removes the records: in `Replicated`, the digest check then repairs files that
-        /// are behind Keeper. With the temporary file in any other state, the load reports `CORRUPTED_DATA` and the files need manual repair.
-        unfinished_exchange = fmt::format("{} and {}", record.old_path, record.new_path);
-        other_db.unfinished_exchange = unfinished_exchange;
-        LOG_ERROR(log, "Cannot finish the exchange of {}, DDL on the databases of both files fails until the next load", unfinished_exchange);
-
-        /// The query fails, but with the temporary file left, the exchange can still take effect at the next load.
-        bool tmp_exists = false;
+        /// exchange. Without the temporary file it only removes the records: in `Replicated`, the replica recovery from Keeper then
+        /// repairs files that are behind Keeper. With the temporary file in any other state, the load reports `CORRUPTED_DATA` and
+        /// the files need manual repair. The hint tells the user which of these the restart does.
+        std::optional<bool> tmp_exists;
         try
         {
             tmp_exists = disk->existsFile(tmp_path);
@@ -843,37 +873,70 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
         {
             tryLogCurrentException(log, fmt::format("Cannot check whether {} exists", tmp_path));
         }
-        if (tmp_exists)
+
+        const String & record_path = record_paths.front();
+        String hint;
+        if (tmp_exists.has_value() && *tmp_exists)
         {
-            const String hint = fmt::format(
-                "The temporary file {} is left, so the next load finishes the exchange from its record, "
+            hint = fmt::format(
+                "The temporary file {} is left, so the next load finishes the exchange from its record {}, "
                 "or reports `CORRUPTED_DATA` if the files hold none of the recorded contents",
-                tmp_path);
-            try
-            {
-                std::rethrow_exception(error);
-            }
-            catch (Exception & e)
-            {
-                e.addMessage(hint);
-                throw;
-            }
-            catch (...)
-            {
-                /// A failed move on a local disk usually arrives as `std::filesystem::filesystem_error`, which cannot carry the hint.
-                /// The new exception keeps its code and message. The version is left out, because the final report adds it.
-                auto e = Exception::createRuntime(
-                    getCurrentExceptionCode(),
-                    getCurrentExceptionMessage(
-                        /* with_stacktrace */ false, /* check_embedded_stacktrace */ false, /* with_extra_info */ true, /* with_version */ false));
-                e.addMessage(hint);
-                throw e;
-            }
+                tmp_path, record_path);
         }
-        std::rethrow_exception(error);
+        else
+        {
+            if (tmp_exists.has_value())
+                hint = fmt::format("The temporary file {} is not left, so ", tmp_path);
+            else
+                hint = fmt::format(
+                    "Cannot check whether the temporary file {} is left. If it is, the next load finishes the exchange from its record {}. "
+                    "If it is not, ",
+                    tmp_path, record_path);
+            if (has_keeper_transaction)
+                hint += fmt::format(
+                    "the next load removes the record {} and leaves the files as they are, behind Keeper, which already holds the exchange. "
+                    "The replica is then recovered from Keeper if the database setting `check_consistency` is enabled, which is the default: "
+                    "tables that support replication are renamed to match Keeper, and other tables are recreated empty from Keeper, "
+                    "with the originals moved to the database {}, or dropped when the server setting "
+                    "`database_replicated_drop_broken_tables` is enabled",
+                    record_path, backQuote(database_name + DatabaseReplicated::BROKEN_TABLES_SUFFIX));
+            else
+                hint += fmt::format(
+                    "the next load removes the record {} and leaves the two files as they are, "
+                    "so compare them with the contents in the record before the restart",
+                    record_path);
+        }
+
+        unfinished_exchange = fmt::format("{} and {}", record.old_path, record.new_path);
+        unfinished_exchange_hint = hint;
+        other_db.unfinished_exchange = unfinished_exchange;
+        other_db.unfinished_exchange_hint = hint;
+        LOG_ERROR(log, "Cannot finish the exchange of {}, DDL on the databases of both files fails until the server restarts. {}",
+            unfinished_exchange, hint);
+
+        try
+        {
+            std::rethrow_exception(error);
+        }
+        catch (Exception & e)
+        {
+            e.addMessage(hint);
+            throw;
+        }
+        catch (...)
+        {
+            /// A failed move on a local disk usually arrives as `std::filesystem::filesystem_error`, which cannot carry the hint.
+            /// The new exception keeps its code and message. The version is left out, because the final report adds it.
+            auto e = Exception::createRuntime(
+                getCurrentExceptionCode(),
+                getCurrentExceptionMessage(
+                    /* with_stacktrace */ false, /* check_embedded_stacktrace */ false, /* with_extra_info */ true, /* with_version */ false));
+            e.addMessage(hint);
+            throw e;
+        }
     }
 
-    tryRemoveMetadataExchangeRecords(disk, record_paths, log);
+    tryRemoveMetadataExchangeRecords(disk, record_paths, log, /* found_at_load */ false);
     if (outcome == Outcome::FailCleanly)
         std::rethrow_exception(error);
 }

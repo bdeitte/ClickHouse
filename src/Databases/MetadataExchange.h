@@ -48,7 +48,9 @@ std::optional<MetadataExchangeRecord> parseMetadataExchangeRecord(const String &
 Strings writeMetadataExchangeRecords(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync);
 
 /// Best effort: a record without its temporary file is harmless, and the next load removes it.
-void tryRemoveMetadataExchangeRecords(const DiskPtr & disk, const Strings & record_paths, const LoggerPtr & log) noexcept;
+/// A removal is logged at INFO when the load removes files a crash left (`found_at_load`),
+/// and at DEBUG for the routine cleanup after an exchange or a probe.
+void tryRemoveMetadataExchangeRecords(const DiskPtr & disk, const Strings & record_paths, const LoggerPtr & log, bool found_at_load) noexcept;
 
 enum class MetadataExchangeState : uint8_t
 {

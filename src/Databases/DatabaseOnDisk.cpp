@@ -563,6 +563,9 @@ void DatabaseOnDisk::renameTable(
     /// `UNKNOWN_TABLE` and other source-side errors.
     if (this != &to_database)
     {
+        /// Before the source table is detached and its data moves, so that a refusal changes nothing.
+        to_database.checkTablesCanBeCreated();
+
         if (auto * target_db = dynamic_cast<DatabaseOnDisk *>(&to_database))
         {
             /// The destination may still be loading, in which case its table list is incomplete
@@ -998,10 +1001,14 @@ ASTPtr DatabaseOnDisk::parseQueryFromMetadata(
     return ast;
 }
 
+ASTPtr DatabaseOnDisk::readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const
+{
+    return parseQueryFromMetadata(log, getContext(), getDisk(), getObjectMetadataPath(table_name), throw_on_error);
+}
+
 ASTPtr DatabaseOnDisk::getCreateQueryFromMetadata(const String & table_name, bool throw_on_error) const
 {
-    auto db_disk = getDisk();
-    ASTPtr ast = parseQueryFromMetadata(log, getContext(), db_disk, getObjectMetadataPath(table_name), throw_on_error);
+    ASTPtr ast = readCreateQueryFromMetadataFile(table_name, throw_on_error);
 
     if (ast)
     {

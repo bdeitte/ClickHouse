@@ -5,6 +5,7 @@
 #include <Databases/DatabasesCommon.h>
 #include <Databases/MetadataExchange.h>
 #include <Storages/IStorage_fwd.h>
+#include <Common/SharedMutex.h>
 
 #include <mutex>
 #include <optional>
@@ -83,6 +84,12 @@ public:
     /// Throws `UNFINISHED` while an exchange of metadata files in the database could not be finished.
     void checkCanBeDroppedOrDetached() const override;
 
+    /// Throws `UNFINISHED` while an exchange of metadata files in the database could not be finished.
+    void checkTablesCanBeDroppedOrDetached() const override;
+
+    /// Throws `UNFINISHED` while an exchange of metadata files in the database could not be finished.
+    void checkTablesCanBeCreated() const override;
+
     UUID tryGetTableUUID(const String & table_name) const override;
 
     void tryCreateSymlink(const StoragePtr & table, bool if_data_path_exist = false);
@@ -92,7 +99,13 @@ public:
     void checkDetachedTableNotInUse(const UUID & uuid) override;
     void setDetachedTableNotInUseForce(const UUID & uuid) override;
 
+    /// Waits for the moves of an exchange with a record, see `metadata_files_mutex`.
+    time_t getObjectMetadataModificationTime(const String & object_name) const override;
+
 protected:
+    /// Waits for the moves of an exchange with a record, see `metadata_files_mutex`.
+    ASTPtr readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const override;
+
     void commitAlterTable(const StorageID & table_id, const String & table_metadata_tmp_path, const String & table_metadata_path, const String & statement, ContextPtr query_context) override;
     void commitCreateTable(const ASTCreateQuery & query, const StoragePtr & table,
                            const String & table_metadata_tmp_path, const String & table_metadata_path, ContextPtr query_context) override;
@@ -129,7 +142,7 @@ private:
     /// Exchanges the two metadata files of `record` with three moves, instead of an atomic exchange,
     /// and removes the records at `record_paths` that `writeMetadataExchangeRecords` wrote before the Keeper commit.
     /// When a move throws, it reads the files and rolls the exchange forward from the record. When it cannot,
-    /// it keeps the records, sets `unfinished_exchange` on both databases and rethrows.
+    /// it keeps the records, sets `unfinished_exchange` and `unfinished_exchange_hint` on both databases and rethrows.
     /// `has_keeper_transaction` tells that the Keeper commit ran. The caller holds `mutex` of both databases.
     void exchangeMetadataFilesWithRecord(
         DatabaseAtomic & other_db,
@@ -143,8 +156,20 @@ private:
 
     /// Set when an exchange failed and could not be finished, so the metadata files may be half exchanged.
     /// DDL on the database fails until a restart. The next load finishes an interrupted exchange from its record,
-    /// or reports `CORRUPTED_DATA` when it cannot. In `Replicated`, the digest check repairs files that are behind Keeper.
+    /// or reports `CORRUPTED_DATA` when it cannot. In `Replicated`, the replica recovery from Keeper repairs files that are behind Keeper.
     String unfinished_exchange TSA_GUARDED_BY(mutex);
+    /// What the restart does about the unfinished exchange, for the error of DDL until then.
+    String unfinished_exchange_hint TSA_GUARDED_BY(mutex);
+
+    /// Held exclusively by `exchangeMetadataFilesWithRecord` while it moves the metadata files, and shared by the readers
+    /// of metadata files that do not take `mutex`, such as `SHOW CREATE TABLE`, `system.tables` and `BACKUP`,
+    /// so that they never see a file missing between the moves, as with an atomic exchange.
+    /// It is taken after `mutex` and `metadataExchangeMutex`, so a reader must not take `mutex` while holding it:
+    /// the shared lock covers only the read of the file, not `getDatabaseName`, which takes `mutex`.
+    /// `finishInterruptedMetadataExchanges` rewrites the files at load without it: it puts each file in place with `replaceFile`,
+    /// so a reader that reaches the database during `ATTACH DATABASE` never sees a file disappear. It can only see a file
+    /// that the crash left missing appear.
+    mutable SharedMutex metadata_files_mutex;
 
     std::mutex exchange_probe_mutex;
     std::optional<bool> exchange_is_atomic TSA_GUARDED_BY(exchange_probe_mutex);

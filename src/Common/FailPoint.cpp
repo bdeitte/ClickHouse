@@ -167,6 +167,7 @@ static struct InitFiu
     ONCE(database_atomic_exchange_fail_after_second_move) \
     ONCE(database_atomic_exchange_fail_after_third_move) \
     REGULAR(database_atomic_exchange_always_fail_before_first_move) \
+    REGULAR(database_atomic_exchange_fail_to_finish) \
     REGULAR(dummy_failpoint) \
     ONCE(system_log_pipeline_fail_after_smt_restore) \
     REGULAR(prefetched_reader_pool_failpoint) \

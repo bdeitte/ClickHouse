@@ -1538,6 +1538,19 @@ StoragePtr InterpreterSystemQuery::doRestartReplica(const StorageID & replica, C
         return nullptr;
     }
 
+    /// Before the table is shut down, so that a database which refuses to detach its tables leaves it working.
+    try
+    {
+        database->checkTablesCanBeDroppedOrDetached();
+    }
+    catch (const Exception & e)
+    {
+        if (throw_on_error)
+            throw;
+        LOG_WARNING(getLogger("InterpreterSystemQuery"), "Cannot RESTART REPLICA {}: {}", replica.getNameForLogs(), e.message());
+        return nullptr;
+    }
+
     SCOPE_EXIT({
         if (table)
             table->is_being_restarted = false;

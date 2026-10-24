@@ -558,6 +558,14 @@ public:
     /// Not called by `TRUNCATE ALL TABLES`, which keeps the tables attached.
     virtual void checkCanBeDroppedOrDetached() const {}
 
+    /// Called by `DROP TABLE` and `DETACH TABLE`, before the table is shut down or its dependencies are removed,
+    /// so that a database which refuses to drop or detach any of its tables fails the query before it changes anything.
+    virtual void checkTablesCanBeDroppedOrDetached() const {}
+
+    /// Called by a move of a table from a database of another engine, before the source table is detached and its data moves,
+    /// so that a database which refuses to create tables fails the query before it changes anything.
+    virtual void checkTablesCanBeCreated() const {}
+
     virtual void waitDetachedTableNotInUse(const UUID & /*uuid*/, std::function<void()> /*throw_if_cancelled*/) { }
     virtual void checkDetachedTableNotInUse(const UUID & /*uuid*/) { }
 

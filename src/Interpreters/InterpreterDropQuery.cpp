@@ -312,6 +312,9 @@ BlockIO InterpreterDropQuery::executeToTableImpl(const ContextPtr & context_, AS
                 DatabaseCatalog::instance().checkTableCanBeRemovedOrRenamed(table_id, check_ref_deps, check_loading_deps, is_drop_or_detach_database);
             }
 
+            /// Before the table is shut down, so that a refusal leaves it working.
+            database->checkTablesCanBeDroppedOrDetached();
+
             context_->onQueryExecutionStarted();
             table->flushAndShutdown();
             TableExclusiveLockHolder table_lock;
@@ -391,6 +394,9 @@ BlockIO InterpreterDropQuery::executeToTableImpl(const ContextPtr & context_, AS
             bool check_ref_deps = getContext()->getSettingsRef()[Setting::check_referential_table_dependencies];
             bool check_loading_deps = !check_ref_deps && getContext()->getSettingsRef()[Setting::check_table_dependencies];
             DatabaseCatalog::instance().checkTableCanBeRemovedOrRenamed(table_id, check_ref_deps, check_loading_deps, is_drop_or_detach_database);
+
+            /// Before the table is shut down, so that a refusal leaves it working.
+            database->checkTablesCanBeDroppedOrDetached();
 
             context_->onQueryExecutionStarted();
             table->flushAndShutdown(true);

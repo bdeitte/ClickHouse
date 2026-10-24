@@ -118,12 +118,18 @@ Strings writeMetadataExchangeRecords(const DiskPtr & disk, const MetadataExchang
     return record_paths;
 }
 
-void tryRemoveMetadataExchangeRecords(const DiskPtr & disk, const Strings & record_paths, const LoggerPtr & log) noexcept
+void tryRemoveMetadataExchangeRecords(const DiskPtr & disk, const Strings & record_paths, const LoggerPtr & log, bool found_at_load) noexcept
 {
     for (const auto & path : record_paths)
     {
         try
         {
+            if (!disk->existsFile(path))
+                continue;
+            if (found_at_load)
+                LOG_INFO(log, "Removing file {}", path);
+            else
+                LOG_DEBUG(log, "Removing file {}", path);
             disk->removeFileIfExists(path);
         }
         catch (...)
@@ -167,9 +173,14 @@ void finishMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord &
 
 void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & metadata_dir, bool fsync, const LoggerPtr & log)
 {
-    /// The two databases of an exchange between databases can be loaded at the same time, and both may act on its record.
-    std::lock_guard lock(metadataExchangeMutex());
-
+    /// The directory is scanned without the mutex: databases load in parallel, and most have no records,
+    /// so a global mutex around every listing would serialize loading for nothing. No exchange writes records
+    /// into this directory meanwhile: a record is written only after both tables of the exchange are resolved,
+    /// and this load has not attached any table of this database yet. A load other than at server startup also
+    /// needs a prior `DETACH DATABASE`, which takes the database mutex that a live exchange holds, and a fenced
+    /// database refuses to detach, so kept records are only scanned again after a restart. The exchange writer
+    /// already relies on this ordering, not on the mutex: it releases the mutex between writing its records and
+    /// moving the files, for the Keeper commit.
     const String record_suffix = String(".sql") + exchange_record_suffix;
     const String record_tmp_suffix = record_suffix + ".tmp";
     Strings record_paths;
@@ -186,9 +197,16 @@ void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & met
             leftover_paths.push_back(path);
     }
 
+    if (record_paths.empty() && leftover_paths.empty())
+        return;
+
+    /// The two databases of an exchange between databases can be loaded at the same time, and both may act on its record.
+    /// Each record found above is read again under the mutex, so a record the other database finished is skipped.
+    std::lock_guard lock(metadataExchangeMutex());
+
     /// A record is complete before its exchange begins, so a leftover temporary record belongs to an exchange that did not begin.
     /// No probe runs while its database loads, so a probe file is a leftover of a crashed probe.
-    tryRemoveMetadataExchangeRecords(disk, leftover_paths, log);
+    tryRemoveMetadataExchangeRecords(disk, leftover_paths, log, /* found_at_load */ true);
 
     for (const auto & record_path : record_paths)
     {
@@ -208,7 +226,7 @@ void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & met
         const String primary_path = metadataExchangeRecordPath(record->old_path);
         if (record_path != primary_path && readMetadataFileIfExists(disk, primary_path) != content)
         {
-            tryRemoveMetadataExchangeRecords(disk, {record_path}, log);
+            tryRemoveMetadataExchangeRecords(disk, {record_path}, log, /* found_at_load */ true);
             continue;
         }
 
@@ -221,7 +239,9 @@ void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & met
                 throw Exception(
                     ErrorCodes::CORRUPTED_DATA,
                     "Cannot finish the interrupted exchange of {} and {} recorded in {}: the temporary file {} or one of the two files "
-                    "holds none of the recorded contents. The files are left as they are",
+                    "holds none of the recorded contents. The files are left as they are. To repair manually, compare the two files "
+                    "and the temporary file with the two contents in the record, restore the intended content of each of the two "
+                    "files, remove the record and the temporary file, and load the database again",
                     record->old_path, record->new_path, record_path, metadataExchangeTmpPath(record->old_path));
 
             finishMetadataExchange(disk, *record, fsync);
@@ -232,7 +252,7 @@ void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & met
         const String copy_path = metadataExchangeRecordPath(record->new_path);
         if (copy_path != primary_path && readMetadataFileIfExists(disk, copy_path) == content)
             finished_record_paths.push_back(copy_path);
-        tryRemoveMetadataExchangeRecords(disk, finished_record_paths, log);
+        tryRemoveMetadataExchangeRecords(disk, finished_record_paths, log, /* found_at_load */ true);
     }
 }
 
