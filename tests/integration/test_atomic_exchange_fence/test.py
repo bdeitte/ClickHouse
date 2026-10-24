@@ -229,6 +229,20 @@ def test_fence_refuses_move_from_ordinary(started_cluster):
     )
     assert "`x` UInt8" in keeper_columns
     assert "`z`" not in keeper_columns
+    # A `CREATE` is refused before the storage is built, which creates the replica of a
+    # `ReplicatedMergeTree` table in Keeper.
+    create_c = (
+        "CREATE TABLE fence_atomic.c (x UInt8)"
+        " ENGINE = ReplicatedMergeTree('/clickhouse/tables/fence_atomic_c', 'r1') ORDER BY x"
+    )
+    assert "UNFINISHED" in node.query_and_get_error(create_c)
+    assert (
+        node.query(
+            "SELECT count() FROM system.zookeeper"
+            " WHERE path = '/clickhouse/tables' AND name = 'fence_atomic_c'"
+        ).strip()
+        == "0"
+    )
 
     node.restart_clickhouse()
 
@@ -241,6 +255,7 @@ def test_fence_refuses_move_from_ordinary(started_cluster):
     assert not any(name.endswith(".tmp_exchange") for name in files)
     node.query("RENAME TABLE fence_ordinary.t TO fence_atomic.t")
     assert node.query("SELECT count() FROM fence_atomic.t").strip() == "1"
+    node.query(create_c)
     node.query("DROP TABLE fence_ordinary.r_alias SYNC")
     node.query("DROP DATABASE fence_atomic SYNC")
     node.query("DROP DATABASE fence_ordinary SYNC")

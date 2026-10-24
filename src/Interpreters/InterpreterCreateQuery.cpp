@@ -2827,6 +2827,10 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
             database->checkTableNameLength(create.getTable());
     }
 
+    /// Before the storage is built: `ReplicatedMergeTree` creates its replica in Keeper in the constructor.
+    /// This also covers the temporary table of `doCreateOrReplaceTable`. `commitCreateTable` checks again.
+    database->checkTablesCanBeCreated();
+
     data_path = database->getTableDataPath(create);
     // When creating a table, when checking if the data path exists, it should use the local disk to check, not the database disk. Because the database disk stores metadata files only.
     auto full_data_path = fs::path{getContext()->getPath()} / data_path;

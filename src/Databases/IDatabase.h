@@ -562,8 +562,9 @@ public:
     /// so that a database which refuses to drop or detach any of its tables fails the query before it changes anything.
     virtual void checkTablesCanBeDroppedOrDetached() const {}
 
-    /// Called by a move of a table from a database of another engine, before the source table is detached and its data moves,
-    /// so that a database which refuses to create tables fails the query before it changes anything.
+    /// Called by `CREATE` and `ATTACH` before the storage is built, and by a move of a table from a database of another engine
+    /// before the source table is detached and its data moves, so that a database which refuses to create tables fails the query
+    /// before it changes anything.
     virtual void checkTablesCanBeCreated() const {}
 
     /// Called by an `ALTER` that changes the metadata of a table, before the query is replicated, and by `ReplicatedMergeTree`
