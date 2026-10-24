@@ -10,7 +10,14 @@ from helpers.test_tools import assert_eq_with_retry
 
 cluster = ClickHouseCluster(__file__)
 
-node = cluster.add_instance("node", with_zookeeper=True, stay_alive=True)
+# The restart attaches the `ReplicatedMergeTree` tables outside of a DDL query, so their default
+# Keeper path takes `{shard}` and `{replica}` from these macros, not from the `Replicated` database.
+node = cluster.add_instance(
+    "node",
+    with_zookeeper=True,
+    stay_alive=True,
+    macros={"shard": "shard1", "replica": "replica1"},
+)
 
 
 @pytest.fixture(scope="module")
