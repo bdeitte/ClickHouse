@@ -65,8 +65,8 @@ def test_fence_until_restart(started_cluster):
     node.query(
         "CREATE TABLE fence_db.untouched (x UInt8) ENGINE = ReplicatedMergeTree ORDER BY x"
     )
-    # `ALTER` of a `ReplicatedMergeTree` table commits to Keeper before the database writes the metadata file,
-    # so the refused `ALTER` is checked on a table that does not support replication.
+    # The fence refuses `ALTER` of a table that does not support replication when it commits the change,
+    # and of a `ReplicatedMergeTree` table before the table commits it to Keeper, so both are checked.
     node.query(
         "CREATE TABLE fence_db.plain (x UInt8) ENGINE = MergeTree ORDER BY x",
         settings={"distributed_ddl_output_mode": "none"},
@@ -114,6 +114,7 @@ def test_fence_until_restart(started_cluster):
     for query in [
         "CREATE TABLE fence_db.c (x UInt8) ENGINE = MergeTree ORDER BY x",
         "ALTER TABLE fence_db.plain ADD COLUMN z UInt8",
+        "ALTER TABLE fence_db.untouched ADD COLUMN z UInt8",
         "RENAME TABLE fence_db.plain TO fence_db.renamed",
         "EXCHANGE TABLES fence_db.plain AND fence_db.untouched",
     ]:
@@ -128,6 +129,12 @@ def test_fence_until_restart(started_cluster):
         == "['a','b','plain','untouched']"
     )
     assert has_column("fence_db", "plain", "z") == "0"
+    assert has_column("fence_db", "untouched", "z") == "0"
+    # A mutation does not change the metadata file, so the fence lets it through.
+    node.query(
+        "ALTER TABLE fence_db.untouched DELETE WHERE x = 0",
+        settings={"distributed_ddl_output_mode": "none"},
+    )
     # The fence refuses to restart a replica before the table is shut down,
     # and `SYSTEM RESTART REPLICAS` skips the tables of the fenced database.
     assert "UNFINISHED" in node.query_and_get_error(
@@ -149,6 +156,8 @@ def test_fence_until_restart(started_cluster):
         retry_count=60,
     )
     assert has_column("fence_db", "b", "y") == "0"
+    # Keeper did not get the refused `ALTER`, so the repair does not add its column.
+    assert has_column("fence_db", "untouched", "z") == "0"
     assert node.query("SELECT count() FROM fence_db.a").strip() == "1"
     files = metadata_files("fence_db")
     assert not any(name.startswith(".") for name in files)
@@ -179,6 +188,24 @@ def test_fence_refuses_move_from_ordinary(started_cluster):
     )
     node.query("CREATE TABLE fence_ordinary.t (x UInt8) ENGINE = MergeTree ORDER BY x")
     node.query("INSERT INTO fence_ordinary.t VALUES (1)")
+    # An `ALTER` through an alias in another database reaches the `ReplicatedMergeTree` table without
+    # the check of `InterpreterAlterQuery`, which checks only the database of the alias.
+    node.query(
+        "CREATE TABLE fence_atomic.r (x UInt8)"
+        " ENGINE = ReplicatedMergeTree('/clickhouse/tables/fence_atomic_r', 'r1') ORDER BY x"
+    )
+    node.query(
+        "CREATE TABLE fence_ordinary.r_alias ENGINE = Alias('fence_atomic', 'r')"
+    )
+    # A second replica outside the fenced database sends `ALTER_METADATA` entries to `r`.
+    node.query(
+        "CREATE TABLE fence_ordinary.r2 (x UInt8)"
+        " ENGINE = ReplicatedMergeTree('/clickhouse/tables/fence_atomic_r', 'r2') ORDER BY x"
+    )
+    # A table dropped before the fence, for `UNDROP` into the fenced database.
+    node.query("CREATE TABLE fence_atomic.u (x UInt8) ENGINE = MergeTree ORDER BY x")
+    node.query("INSERT INTO fence_atomic.u VALUES (1)")
+    node.query("DROP TABLE fence_atomic.u")
 
     failpoints = [
         "database_atomic_exchange_with_record",
@@ -201,16 +228,79 @@ def test_fence_refuses_move_from_ordinary(started_cluster):
         "RENAME TABLE fence_ordinary.t TO fence_atomic.t"
     )
     assert node.query("SELECT count() FROM fence_ordinary.t").strip() == "1"
+    # The `ReplicatedMergeTree` table refuses the `ALTER` before it commits the change to Keeper.
+    assert "UNFINISHED" in node.query_and_get_error(
+        "ALTER TABLE fence_ordinary.r_alias ADD COLUMN z UInt8"
+    )
+    keeper_columns = node.query(
+        "SELECT value FROM system.zookeeper"
+        " WHERE path = '/clickhouse/tables/fence_atomic_r' AND name = 'columns'"
+    )
+    assert "`x` UInt8" in keeper_columns
+    assert "`z`" not in keeper_columns
+    # A `CREATE` is refused before the storage is built, which creates the replica of a
+    # `ReplicatedMergeTree` table in Keeper.
+    create_c = (
+        "CREATE TABLE fence_atomic.c (x UInt8)"
+        " ENGINE = ReplicatedMergeTree('/clickhouse/tables/fence_atomic_c', 'r1') ORDER BY x"
+    )
+    assert "UNFINISHED" in node.query_and_get_error(create_c)
+    assert (
+        node.query(
+            "SELECT count() FROM system.zookeeper"
+            " WHERE path = '/clickhouse/tables' AND name = 'fence_atomic_c'"
+        ).strip()
+        == "0"
+    )
+    # `UNDROP` is refused before the table leaves the dropped-table queue, so it can be repeated.
+    for _ in range(2):
+        assert "UNFINISHED" in node.query_and_get_error("UNDROP TABLE fence_atomic.u")
+    # The replica `r` refuses the `ALTER_METADATA` entry of `r2` before it changes its own metadata
+    # nodes in Keeper, and retries it until the restart.
+    node.query("ALTER TABLE fence_ordinary.r2 ADD COLUMN w UInt8")
+    assert_eq_with_retry(
+        node,
+        "SELECT count() FROM system.replication_queue"
+        " WHERE database = 'fence_atomic' AND table = 'r' AND type = 'ALTER_METADATA'"
+        " AND last_exception LIKE '%UNFINISHED%'",
+        "1",
+        retry_count=60,
+    )
+    replica_columns = node.query(
+        "SELECT value FROM system.zookeeper"
+        " WHERE path = '/clickhouse/tables/fence_atomic_r/replicas/r1' AND name = 'columns'"
+    )
+    assert "`w`" not in replica_columns
 
     node.restart_clickhouse()
 
     # The load finishes the exchange from its record, and the fence is gone.
     assert has_column("fence_atomic", "a", "y") == "1"
     assert has_column("fence_atomic", "b", "y") == "0"
+    assert has_column("fence_atomic", "r", "z") == "0"
+    # The replica applies the entry after the restart and is not read-only.
+    assert_eq_with_retry(
+        node,
+        "SELECT count() FROM system.columns"
+        " WHERE database = 'fence_atomic' AND table = 'r' AND name = 'w'",
+        "1",
+        retry_count=60,
+    )
+    assert (
+        node.query(
+            "SELECT is_readonly FROM system.replicas"
+            " WHERE database = 'fence_atomic' AND table = 'r'"
+        ).strip()
+        == "0"
+    )
+    node.query("UNDROP TABLE fence_atomic.u")
+    assert node.query("SELECT count() FROM fence_atomic.u").strip() == "1"
     files = metadata_files("fence_atomic")
     assert not any(name.startswith(".") for name in files)
     assert not any(name.endswith(".tmp_exchange") for name in files)
     node.query("RENAME TABLE fence_ordinary.t TO fence_atomic.t")
     assert node.query("SELECT count() FROM fence_atomic.t").strip() == "1"
+    node.query(create_c)
+    node.query("DROP TABLE fence_ordinary.r_alias SYNC")
     node.query("DROP DATABASE fence_atomic SYNC")
     node.query("DROP DATABASE fence_ordinary SYNC")

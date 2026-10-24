@@ -26,9 +26,9 @@ namespace ErrorCodes
 namespace
 {
 
-constexpr auto exchange_tmp_suffix = ".tmp_exchange";
 constexpr auto exchange_record_suffix = ".exchange";
 constexpr auto exchange_record_header = "exchange v1";
+constexpr auto exchange_write_suffix = ".exchange_write";
 
 std::optional<String> readMetadataFileIfExists(const DiskPtr & disk, const String & path)
 {
@@ -37,10 +37,19 @@ std::optional<String> readMetadataFileIfExists(const DiskPtr & disk, const Strin
     return readMetadataFile(disk, path);
 }
 
+/// `dir/a.sql` -> `dir/.a.sql.exchange_write`. Not `a.sql.tmp`, which `ALTER` writes before it takes the database mutex,
+/// so a roll forward during a concurrent `ALTER` of the same table could put the `ALTER`'s content in place of the recorded one.
+String metadataExchangeWritePath(const String & metadata_file_path)
+{
+    fs::path path(metadata_file_path);
+    return (path.parent_path() / ("." + path.filename().string() + exchange_write_suffix)).string();
+}
+
 void replaceMetadataFile(const DiskPtr & disk, const String & path, const String & content, bool fsync)
 {
-    writeMetadataFile(disk, path + ".tmp", content, fsync);
-    disk->replaceFile(path + ".tmp", path);
+    const String write_path = metadataExchangeWritePath(path);
+    writeMetadataFile(disk, write_path, content, fsync);
+    disk->replaceFile(write_path, path);
 }
 
 }
@@ -59,7 +68,7 @@ String metadataExchangeRecordPath(const String & metadata_file_path)
 
 String metadataExchangeTmpPath(const String & old_path)
 {
-    return old_path + exchange_tmp_suffix;
+    return old_path + metadata_exchange_tmp_suffix;
 }
 
 String serializeMetadataExchangeRecord(const MetadataExchangeRecord & record)
@@ -183,6 +192,7 @@ void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & met
     /// moving the files, for the Keeper commit.
     const String record_suffix = String(".sql") + exchange_record_suffix;
     const String record_tmp_suffix = record_suffix + ".tmp";
+    const String write_suffix = String(".sql") + exchange_write_suffix;
     Strings record_paths;
     Strings leftover_paths;
     for (const auto it = disk->iterateDirectory(metadata_dir); it->isValid(); it->next())
@@ -193,7 +203,8 @@ void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & met
         const String path = (fs::path(metadata_dir) / file_name).string();
         if (file_name.ends_with(record_suffix))
             record_paths.push_back(path);
-        else if (file_name.ends_with(record_tmp_suffix) || file_name.starts_with(metadata_exchange_probe_prefix))
+        else if (file_name.ends_with(record_tmp_suffix) || file_name.ends_with(write_suffix)
+                 || file_name.starts_with(metadata_exchange_probe_prefix))
             leftover_paths.push_back(path);
     }
 
@@ -205,6 +216,7 @@ void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & met
     std::lock_guard lock(metadataExchangeMutex());
 
     /// A record is complete before its exchange begins, so a leftover temporary record belongs to an exchange that did not begin.
+    /// A leftover write of a finish belongs to an exchange whose temporary file is still there, so finishing it below writes it again.
     /// No probe runs while its database loads, so a probe file is a leftover of a crashed probe.
     tryRemoveMetadataExchangeRecords(disk, leftover_paths, log, /* found_at_load */ true);
 

@@ -1616,6 +1616,8 @@ void DatabaseCatalog::undropTable(StorageID table_id, std::function<void()> thro
     /// its table list is incomplete and the check would undercount. Do it before taking
     /// `tables_marked_dropped_mutex`, because startup can drop tables.
     database->waitDatabaseStarted();
+    /// Before the metadata file moves and the table leaves the dropped-table queue, so that a refusal changes nothing.
+    database->checkTablesCanBeCreated();
 
     String latest_metadata_dropped_path;
     TableMarkedAsDropped dropped_table;

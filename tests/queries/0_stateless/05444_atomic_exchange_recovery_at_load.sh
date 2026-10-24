@@ -80,7 +80,7 @@ cp "$DIR2/b.sql" "$B2"
 function remove_case_files()
 {
     rm -f -- "$1"/.a.sql.exchange "$1"/.b.sql.exchange "$1"/.c.sql.exchange "$1"/.a.sql.exchange.tmp \
-        "$1"/.exchange_probe_test_1 "$1"/a.sql.tmp_exchange
+        "$1"/.exchange_probe_test_1 "$1"/a.sql.tmp_exchange "$1"/.a.sql.exchange_write
 }
 
 function restore_main()
@@ -255,3 +255,15 @@ print_dot_files "$DIR1"
 print_dot_files "$DIR2"
 echo
 restore_pair
+
+echo "case 10: a finish that a crash interrupted after the first move, with its write left"
+$CLICKHOUSE_CLIENT -q "DETACH DATABASE $DB"
+main_record > "$DIR/.a.sql.exchange"
+cp "$A" "$DIR/a.sql.tmp_exchange"
+rm -f -- "$DIR/a.sql"
+echo "partial write" > "$DIR/.a.sql.exchange_write"
+$CLICKHOUSE_CLIENT -q "ATTACH DATABASE $DB"
+print_exchanged
+print_dot_files "$DIR"
+echo
+restore_main
