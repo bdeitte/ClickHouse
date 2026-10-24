@@ -837,6 +837,14 @@ void DatabaseOnDisk::iterateMetadataFiles(const IteratingFunction & process_meta
             /// The required files have names like `table_name.sql`
             metadata_files.emplace_back(file_name, true);
         }
+        else if (endsWith(file_name, String(".sql") + metadata_exchange_tmp_suffix))
+        {
+            /// `DatabaseAtomic::loadTablesMetadata` finishes the exchange before this, except on a read-only disk.
+            throw Exception(ErrorCodes::INCORRECT_FILE_NAME,
+                "The temporary file {} of an exchange of metadata files that was not finished is left in metadata directory {}. "
+                "A load finishes the exchange from its record only when the disk of the database is writable",
+                file_name, getMetadataPath());
+        }
         else
             throw Exception(ErrorCodes::INCORRECT_FILE_NAME, "Incorrect file extension: {} in metadata directory {}", file_name, getMetadataPath());
     }

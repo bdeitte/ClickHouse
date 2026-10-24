@@ -26,7 +26,6 @@ namespace ErrorCodes
 namespace
 {
 
-constexpr auto exchange_tmp_suffix = ".tmp_exchange";
 constexpr auto exchange_record_suffix = ".exchange";
 constexpr auto exchange_record_header = "exchange v1";
 constexpr auto exchange_write_suffix = ".exchange_write";
@@ -69,7 +68,7 @@ String metadataExchangeRecordPath(const String & metadata_file_path)
 
 String metadataExchangeTmpPath(const String & old_path)
 {
-    return old_path + exchange_tmp_suffix;
+    return old_path + metadata_exchange_tmp_suffix;
 }
 
 String serializeMetadataExchangeRecord(const MetadataExchangeRecord & record)

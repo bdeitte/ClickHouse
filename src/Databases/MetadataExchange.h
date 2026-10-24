@@ -34,6 +34,9 @@ std::mutex & metadataExchangeMutex();
 /// `dir/a.sql` -> `dir/.a.sql.exchange`: listings of metadata directories skip names starting with a dot.
 String metadataExchangeRecordPath(const String & metadata_file_path);
 
+/// The suffix of the temporary file of an exchange.
+inline constexpr auto metadata_exchange_tmp_suffix = ".tmp_exchange";
+
 /// The temporary file of an exchange: `old_path + ".tmp_exchange"`.
 String metadataExchangeTmpPath(const String & old_path);
 

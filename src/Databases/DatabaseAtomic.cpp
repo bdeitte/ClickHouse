@@ -365,6 +365,9 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
 
     /// Probe after `waitDatabaseStarted`, so that loading has removed the probe files a crash left,
     /// and before the locks of the databases, so that a probe does not hold them while it writes files.
+    /// The probe runs before the exchange, not after `renameExchangeIfSupported` returns false, because the record is written
+    /// before the Keeper commit. So the first exchange in a database fails when the probe files cannot be written, such as
+    /// on a full disk, even where the filesystem exchanges files atomically.
     bool use_record = false;
     if (can_emulate_exchange)
     {
@@ -918,6 +921,11 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
                     "so compare them with the contents in the record before the restart",
                     record_path);
         }
+        /// The fence also refuses the cleanup `DROP` of the temporary table, and the `ALTER` entries that the tables replicate.
+        hint += ". If the exchange was done by `CREATE OR REPLACE`, `REPLACE TABLE` or a refresh of a materialized view, "
+            "its temporary table could not be dropped: after the restart, drop it if it is still there. "
+            "Until the restart, `ReplicatedMergeTree` tables in the database cannot apply `ALTER` entries from other replicas, "
+            "and the entries queued after them wait";
 
         unfinished_exchange = fmt::format("{} and {}", record.old_path, record.new_path);
         unfinished_exchange_hint = hint;
