@@ -6900,6 +6900,9 @@ bool StorageReplicatedMergeTree::executeMetadataAlter(const StorageReplicatedMer
         auto alter_context = getContext();
 
         auto database = DatabaseCatalog::instance().getDatabase(table_id.database_name);
+        /// Before the metadata nodes of this replica change in Keeper ahead of the metadata file. Otherwise the restart that
+        /// clears the fence finds the old file behind the new nodes, and the table stays read-only. The entry is retried.
+        database->checkTablesCanBeAltered();
         bool is_in_replicated_database = database->getEngineName() == "Replicated";
 
         if (is_in_replicated_database)

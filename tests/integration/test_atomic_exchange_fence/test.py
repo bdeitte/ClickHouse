@@ -197,6 +197,15 @@ def test_fence_refuses_move_from_ordinary(started_cluster):
     node.query(
         "CREATE TABLE fence_ordinary.r_alias ENGINE = Alias('fence_atomic', 'r')"
     )
+    # A second replica outside the fenced database sends `ALTER_METADATA` entries to `r`.
+    node.query(
+        "CREATE TABLE fence_ordinary.r2 (x UInt8)"
+        " ENGINE = ReplicatedMergeTree('/clickhouse/tables/fence_atomic_r', 'r2') ORDER BY x"
+    )
+    # A table dropped before the fence, for `UNDROP` into the fenced database.
+    node.query("CREATE TABLE fence_atomic.u (x UInt8) ENGINE = MergeTree ORDER BY x")
+    node.query("INSERT INTO fence_atomic.u VALUES (1)")
+    node.query("DROP TABLE fence_atomic.u")
 
     failpoints = [
         "database_atomic_exchange_with_record",
@@ -243,6 +252,25 @@ def test_fence_refuses_move_from_ordinary(started_cluster):
         ).strip()
         == "0"
     )
+    # `UNDROP` is refused before the table leaves the dropped-table queue, so it can be repeated.
+    for _ in range(2):
+        assert "UNFINISHED" in node.query_and_get_error("UNDROP TABLE fence_atomic.u")
+    # The replica `r` refuses the `ALTER_METADATA` entry of `r2` before it changes its own metadata
+    # nodes in Keeper, and retries it until the restart.
+    node.query("ALTER TABLE fence_ordinary.r2 ADD COLUMN w UInt8")
+    assert_eq_with_retry(
+        node,
+        "SELECT count() FROM system.replication_queue"
+        " WHERE database = 'fence_atomic' AND table = 'r' AND type = 'ALTER_METADATA'"
+        " AND last_exception LIKE '%UNFINISHED%'",
+        "1",
+        retry_count=60,
+    )
+    replica_columns = node.query(
+        "SELECT value FROM system.zookeeper"
+        " WHERE path = '/clickhouse/tables/fence_atomic_r/replicas/r1' AND name = 'columns'"
+    )
+    assert "`w`" not in replica_columns
 
     node.restart_clickhouse()
 
@@ -250,6 +278,23 @@ def test_fence_refuses_move_from_ordinary(started_cluster):
     assert has_column("fence_atomic", "a", "y") == "1"
     assert has_column("fence_atomic", "b", "y") == "0"
     assert has_column("fence_atomic", "r", "z") == "0"
+    # The replica applies the entry after the restart and is not read-only.
+    assert_eq_with_retry(
+        node,
+        "SELECT count() FROM system.columns"
+        " WHERE database = 'fence_atomic' AND table = 'r' AND name = 'w'",
+        "1",
+        retry_count=60,
+    )
+    assert (
+        node.query(
+            "SELECT is_readonly FROM system.replicas"
+            " WHERE database = 'fence_atomic' AND table = 'r'"
+        ).strip()
+        == "0"
+    )
+    node.query("UNDROP TABLE fence_atomic.u")
+    assert node.query("SELECT count() FROM fence_atomic.u").strip() == "1"
     files = metadata_files("fence_atomic")
     assert not any(name.startswith(".") for name in files)
     assert not any(name.endswith(".tmp_exchange") for name in files)

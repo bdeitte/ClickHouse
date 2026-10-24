@@ -562,14 +562,14 @@ public:
     /// so that a database which refuses to drop or detach any of its tables fails the query before it changes anything.
     virtual void checkTablesCanBeDroppedOrDetached() const {}
 
-    /// Called by `CREATE` and `ATTACH` before the storage is built, and by a move of a table from a database of another engine
-    /// before the source table is detached and its data moves, so that a database which refuses to create tables fails the query
-    /// before it changes anything.
+    /// Called by `CREATE` and `ATTACH` before the storage is built, by `UNDROP` before the metadata file moves back,
+    /// and by a move of a table from a database of another engine before the source table is detached and its data moves,
+    /// so that a database which refuses to create tables fails the query before it changes anything.
     virtual void checkTablesCanBeCreated() const {}
 
     /// Called by an `ALTER` that changes the metadata of a table, before the query is replicated, and by `ReplicatedMergeTree`
-    /// before it commits the change to Keeper ahead of the metadata file, so that a database which refuses to alter its tables
-    /// fails the query before it changes anything.
+    /// before it commits the change to Keeper ahead of the metadata file, either for its own `ALTER` or for an `ALTER_METADATA`
+    /// entry from another replica, so that a database which refuses to alter its tables fails the query before it changes anything.
     virtual void checkTablesCanBeAltered() const {}
 
     virtual void waitDetachedTableNotInUse(const UUID & /*uuid*/, std::function<void()> /*throw_if_cancelled*/) { }
