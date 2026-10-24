@@ -7098,6 +7098,10 @@ void StorageReplicatedMergeTree::alter(
     auto table_id = getStorageID();
     const auto & query_settings = query_context->getSettingsRef();
 
+    /// `InterpreterAlterQuery` checks the database of the altered table, but an alter of a view or an alias can reach
+    /// a table in another database. Before the change is committed to Keeper, ahead of the metadata file.
+    DatabaseCatalog::instance().getDatabase(table_id.database_name)->checkTablesCanBeAltered();
+
     auto metadata_snapshot = getInMemoryMetadataPtr(query_context, false);
     StorageInMemoryMetadata future_metadata = *metadata_snapshot;
     /// Snapshot the sorting key before applying commands, to compare with the resolved future one.

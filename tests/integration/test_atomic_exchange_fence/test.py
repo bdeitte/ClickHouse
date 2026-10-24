@@ -65,8 +65,8 @@ def test_fence_until_restart(started_cluster):
     node.query(
         "CREATE TABLE fence_db.untouched (x UInt8) ENGINE = ReplicatedMergeTree ORDER BY x"
     )
-    # `ALTER` of a `ReplicatedMergeTree` table commits to Keeper before the database writes the metadata file,
-    # so the refused `ALTER` is checked on a table that does not support replication.
+    # The fence refuses `ALTER` of a table that does not support replication when it commits the change,
+    # and of a `ReplicatedMergeTree` table before the table commits it to Keeper, so both are checked.
     node.query(
         "CREATE TABLE fence_db.plain (x UInt8) ENGINE = MergeTree ORDER BY x",
         settings={"distributed_ddl_output_mode": "none"},
@@ -114,6 +114,7 @@ def test_fence_until_restart(started_cluster):
     for query in [
         "CREATE TABLE fence_db.c (x UInt8) ENGINE = MergeTree ORDER BY x",
         "ALTER TABLE fence_db.plain ADD COLUMN z UInt8",
+        "ALTER TABLE fence_db.untouched ADD COLUMN z UInt8",
         "RENAME TABLE fence_db.plain TO fence_db.renamed",
         "EXCHANGE TABLES fence_db.plain AND fence_db.untouched",
     ]:
@@ -128,6 +129,12 @@ def test_fence_until_restart(started_cluster):
         == "['a','b','plain','untouched']"
     )
     assert has_column("fence_db", "plain", "z") == "0"
+    assert has_column("fence_db", "untouched", "z") == "0"
+    # A mutation does not change the metadata file, so the fence lets it through.
+    node.query(
+        "ALTER TABLE fence_db.untouched DELETE WHERE x = 0",
+        settings={"distributed_ddl_output_mode": "none"},
+    )
     # The fence refuses to restart a replica before the table is shut down,
     # and `SYSTEM RESTART REPLICAS` skips the tables of the fenced database.
     assert "UNFINISHED" in node.query_and_get_error(
@@ -149,6 +156,8 @@ def test_fence_until_restart(started_cluster):
         retry_count=60,
     )
     assert has_column("fence_db", "b", "y") == "0"
+    # Keeper did not get the refused `ALTER`, so the repair does not add its column.
+    assert has_column("fence_db", "untouched", "z") == "0"
     assert node.query("SELECT count() FROM fence_db.a").strip() == "1"
     files = metadata_files("fence_db")
     assert not any(name.startswith(".") for name in files)

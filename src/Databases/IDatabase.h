@@ -566,6 +566,11 @@ public:
     /// so that a database which refuses to create tables fails the query before it changes anything.
     virtual void checkTablesCanBeCreated() const {}
 
+    /// Called by an `ALTER` that changes the metadata of a table, before the query is replicated, and by `ReplicatedMergeTree`
+    /// before it commits the change to Keeper ahead of the metadata file, so that a database which refuses to alter its tables
+    /// fails the query before it changes anything.
+    virtual void checkTablesCanBeAltered() const {}
+
     virtual void waitDetachedTableNotInUse(const UUID & /*uuid*/, std::function<void()> /*throw_if_cancelled*/) { }
     virtual void checkDetachedTableNotInUse(const UUID & /*uuid*/) { }
 

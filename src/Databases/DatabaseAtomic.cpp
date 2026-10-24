@@ -583,6 +583,12 @@ void DatabaseAtomic::checkTablesCanBeCreated() const
     assertNoUnfinishedExchangeUnlocked();
 }
 
+void DatabaseAtomic::checkTablesCanBeAltered() const
+{
+    std::lock_guard lock{mutex};
+    assertNoUnfinishedExchangeUnlocked();
+}
+
 ASTPtr DatabaseAtomic::readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const
 {
     std::shared_lock lock(metadata_files_mutex);
