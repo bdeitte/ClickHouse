@@ -1032,7 +1032,8 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
             unfinished_exchange_in_database = unfinished;
             other_db.unfinished_exchange_in_database = unfinished;
         }
-        LOG_ERROR(log, "Cannot finish the exchange of {}, DDL on {} fails until the server restarts. {}",
+        LOG_ERROR(log, "Cannot finish the exchange of {}, DDL on {} and reads of the definitions of the two tables fail "
+            "until the server restarts. {}",
             unfinished.files, fence_database ? "the databases of both files" : "the two tables", hint);
 
         try
