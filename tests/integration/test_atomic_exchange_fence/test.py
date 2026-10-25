@@ -147,7 +147,14 @@ def test_fence_until_restart(started_cluster):
     )
     assert has_column("fence_db", "plain", "z") == "0"
     assert has_column("fence_db", "untouched", "z") == "0"
-    # A mutation does not change the metadata file, so the fence lets it through.
+    # A query that the database replicates through its log ends with a check of the digest, which reads every
+    # metadata file, so the fence refuses it even when it does not change a metadata file, as a mutation of `plain`.
+    # A mutation of a `ReplicatedMergeTree` table in a database with one shard is not replicated through the log,
+    # so the fence lets it through.
+    assert "UNFINISHED" in node.query_and_get_error(
+        "ALTER TABLE fence_db.plain DELETE WHERE x = 0",
+        settings={"distributed_ddl_output_mode": "none"},
+    )
     node.query(
         "ALTER TABLE fence_db.untouched DELETE WHERE x = 0",
         settings={"distributed_ddl_output_mode": "none"},

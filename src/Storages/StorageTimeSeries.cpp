@@ -519,15 +519,10 @@ void StorageTimeSeries::dropInnerTableIfAny(bool sync, ContextPtr local_context)
 
 void StorageTimeSeries::checkTableSizeBelowDropLimit(ContextPtr query_context) const
 {
-    if (!hasInnerTables())
-        return;
-
-    for (auto target_kind : getTargetKinds())
+    /// The tables that `dropInnerTableIfAny` drops.
+    for (const StorageID & inner_table_id : getInnerTablesToDrop(query_context))
     {
-        if (!isInnerTable(target_kind))
-            continue;
-
-        if (auto inner_table = tryGetTargetTable(target_kind, query_context))
+        if (auto inner_table = DatabaseCatalog::instance().tryGetTable(inner_table_id, query_context))
             inner_table->checkTableSizeBelowDropLimit(query_context);
     }
 }

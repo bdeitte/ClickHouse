@@ -179,8 +179,10 @@ private:
     /// or reports `CORRUPTED_DATA` when it cannot. In `Replicated`, the replica recovery from Keeper repairs files that are behind Keeper.
     /// `DROP`, `DETACH` and `TRUNCATE DATABASE` fail too. By table name.
     std::map<String, UnfinishedExchange> unfinished_exchanges TSA_GUARDED_BY(mutex);
-    /// Set in `Replicated` with `unfinished_exchanges`, so that DDL on every table of the database fails until a restart:
-    /// the digest of the database reads every metadata file, so it does not match while two of them are half exchanged.
+    /// Set in `Replicated` with `unfinished_exchanges`, so that DDL on every table of the database, and every other query
+    /// that the database replicates through its log, such as a mutation or `TRUNCATE`, fails until a restart: the digest of
+    /// the database reads every metadata file, so it does not match while two of them are half exchanged. A query that is
+    /// not replicated through the log, such as a mutation of `ReplicatedMergeTree` in a database with one shard, is not refused.
     /// `DDLWorker` runs the queries of the database one at a time, so the fence cannot appear between the check and the commit
     /// of another query. A background `ALTER_METADATA` of `ReplicatedMergeTree` commits its Keeper changes in `commitAlterTable`,
     /// with the metadata file, so it commits both or neither.

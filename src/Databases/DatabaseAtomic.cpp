@@ -594,8 +594,9 @@ void DatabaseAtomic::checkNoUnfinishedExchange(const String & table_name) const
     std::lock_guard lock{mutex};
     if (unfinished_exchange_in_database)
         throw Exception(ErrorCodes::UNFINISHED,
-                        "An exchange of {} in database {} failed and could not be finished, so DDL on the database fails "
-                        "until the server restarts. {}",
+                        "An exchange of {} in database {} failed and could not be finished, so DDL on the database, and the other "
+                        "queries that it replicates through its log, such as mutations, lightweight `DELETE` and `UPDATE` "
+                        "and `TRUNCATE`, fail until the server restarts. {}",
                         unfinished_exchange_in_database->files, backQuote(database_name), unfinished_exchange_in_database->hint);
     if (table_name.empty() && !unfinished_exchanges.empty())
     {
