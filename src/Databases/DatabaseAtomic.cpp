@@ -617,8 +617,40 @@ ASTPtr DatabaseAtomic::readCreateQueryFromMetadataFile(const String & table_name
     if (FailPointInjection::hasAnyFailPointBeenRegistered()
         && CurrentThread::getQueryId().starts_with(pause_before_reading_create_query_query_id_prefix))
         FailPointInjection::pauseFailPoint(FailPoints::database_atomic_pause_before_reading_create_query);
-    std::shared_lock lock(metadata_files_mutex);
-    return DatabaseOrdinary::readCreateQueryFromMetadataFile(table_name, throw_on_error);
+    /// The file of a table of an unfinished exchange can be missing or hold the definition of the other table. Checked before
+    /// the read, so that a missing file is reported as the unfinished exchange, and after it, because an exchange that fails
+    /// during the read sets the fence before it releases `metadata_files_mutex`.
+    auto has_unfinished_exchange = [&]
+    {
+        std::lock_guard lock{mutex};
+        if (!unfinished_exchanges.contains(table_name))
+            return false;
+        if (throw_on_error)
+            assertTableHasNoUnfinishedExchangeUnlocked(table_name);
+        return true;
+    };
+    if (has_unfinished_exchange())
+        return nullptr;
+    ASTPtr ast;
+    {
+        std::shared_lock files_lock(metadata_files_mutex);
+        ast = DatabaseOrdinary::readCreateQueryFromMetadataFile(table_name, throw_on_error);
+    }
+    if (has_unfinished_exchange())
+        return nullptr;
+    return ast;
+}
+
+std::vector<std::pair<ASTPtr, StoragePtr>> DatabaseAtomic::getTablesForBackup(const FilterByNameFunction & filter, const ContextPtr & local_context) const
+{
+    /// Skips a table whose definition cannot be read, which is the case for the tables of an unfinished exchange,
+    /// so they are refused here instead of left out of the backup. Checked after the reads, see `readCreateQueryFromMetadataFile`.
+    auto res = DatabaseOrdinary::getTablesForBackup(filter, local_context);
+    std::lock_guard lock{mutex};
+    for (const auto & [table_name, _] : unfinished_exchanges)
+        if (!filter || filter(table_name))
+            assertTableHasNoUnfinishedExchangeUnlocked(table_name);
+    return res;
 }
 
 String DatabaseAtomic::readObjectMetadataFile(const String & object_name) const
@@ -637,7 +669,8 @@ void DatabaseAtomic::assertTableHasNoUnfinishedExchangeUnlocked(const String & t
 {
     if (auto it = unfinished_exchanges.find(table_name); it != unfinished_exchanges.end())
         throw Exception(ErrorCodes::UNFINISHED,
-                        "An exchange of {} failed and could not be finished, so DDL on table {}.{} fails until the server restarts. {}",
+                        "An exchange of {} failed and could not be finished, so DDL on table {}.{} and reads of its definition "
+                        "fail until the server restarts. {}",
                         it->second.files, backQuote(database_name), backQuote(table_name), it->second.hint);
 }
 
@@ -986,6 +1019,10 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
         else
             hint += "Until the restart, a `ReplicatedMergeTree` table among the two cannot apply `ALTER` entries from other replicas, "
                 "and the entries queued after them wait";
+        /// `DDLWorker` retries `UNFINISHED`, so that the server applies the query after the restart, as the other servers did.
+        hint += ". An `ON CLUSTER` query refused for this reason stays in the distributed DDL queue of this server and is retried "
+            "until the restart, and the `ON CLUSTER` queries queued after it wait. A query that one replica of each shard runs "
+            "for the shard, such as `ALTER` of a `ReplicatedMergeTree` table, is run by another replica instead, or fails after 3 tries";
 
         const UnfinishedExchange unfinished{fmt::format("{} and {}", record.old_path, record.new_path), hint};
         unfinished_exchanges[table_name] = unfinished;

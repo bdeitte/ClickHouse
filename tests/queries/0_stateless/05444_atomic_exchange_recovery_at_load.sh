@@ -267,3 +267,13 @@ print_exchanged
 print_dot_files "$DIR"
 echo
 restore_main
+
+echo "case 11: the temporary file without a record"
+$CLICKHOUSE_CLIENT -q "DETACH DATABASE $DB"
+cp "$B" "$DIR/a.sql.tmp_exchange"
+$CLICKHOUSE_CLIENT -q "ATTACH DATABASE $DB" 2>&1 | grep -o -m1 -e 'INCORRECT_FILE_NAME' -e 'no valid exchange record is next to it'
+print_dot_files "$DIR"
+if [ -f "$DIR/a.sql.tmp_exchange" ]; then echo "the temporary file is left"; fi
+echo
+restore_main
+print_exchanged

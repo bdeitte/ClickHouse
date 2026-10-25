@@ -1223,6 +1223,9 @@ void DatabaseReplicated::reinitializeDDLWorker()
 ASTPtr DatabaseReplicated::tryGetCreateOrAttachTableQuery(const String & name, ContextPtr local_context) const
 {
     auto res = tryGetCreateTableQuery(name, local_context);
+    /// For example, a table of an unfinished exchange, whose metadata file may be missing.
+    if (!res)
+        return nullptr;
     auto & create = res->as<ASTCreateQuery &>();
     create.attach = false;
     if (create.is_materialized_view_with_inner_table())
@@ -2881,8 +2884,8 @@ void DatabaseReplicated::adjustDigestOnTableLostFromRestart(const String & table
 
 String DatabaseReplicated::readMetadataFile(const String & table_name) const
 {
-    /// Waits for the moves of an exchange with a record. `metadata_mutex` does not cover an exchange that another database runs,
-    /// such as an exchange of tables of two `Replicated` databases started on the other one.
+    /// Waits for the moves of an exchange with a record, see `metadata_files_mutex`. `renameTable` holds `metadata_mutex`
+    /// during the moves, but not every caller of this function holds it.
     return readObjectMetadataFile(table_name);
 }
 

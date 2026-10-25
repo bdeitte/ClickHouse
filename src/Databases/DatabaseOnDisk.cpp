@@ -860,14 +860,24 @@ void DatabaseOnDisk::iterateMetadataFiles(const IteratingFunction & process_meta
     /// runs, so the listing can miss it. That load leaves the record in this directory, so this load always lists again,
     /// after `finishInterruptedMetadataExchangesAtLoad` waited for the other load under `metadataExchangeMutex`.
     list_metadata_files();
-    if (has_exchange_files && finishInterruptedMetadataExchangesAtLoad())
+    const bool finished_exchanges = has_exchange_files && finishInterruptedMetadataExchangesAtLoad();
+    if (finished_exchanges)
         list_metadata_files();
 
     if (!exchange_tmp_file_name.empty())
+    {
+        if (finished_exchanges)
+            throw Exception(ErrorCodes::INCORRECT_FILE_NAME,
+                "The temporary file {} of an exchange of metadata files that was not finished is left in metadata directory {}, "
+                "and no valid exchange record is next to it: the record is missing, or a warning in the log reports that it is not "
+                "an exchange record. To repair manually, restore the intended "
+                "content of the two files of the exchange, remove the temporary file, and load the database again",
+                exchange_tmp_file_name, getMetadataPath());
         throw Exception(ErrorCodes::INCORRECT_FILE_NAME,
             "The temporary file {} of an exchange of metadata files that was not finished is left in metadata directory {}. "
-            "A load finishes the exchange from its record only when the disk of the database is writable",
+            "A load finishes the exchange from its record only in an `Atomic` or `Replicated` database on a local disk that is writable",
             exchange_tmp_file_name, getMetadataPath());
+    }
 
     std::sort(metadata_files.begin(), metadata_files.end());
     metadata_files.erase(std::unique(metadata_files.begin(), metadata_files.end()), metadata_files.end());

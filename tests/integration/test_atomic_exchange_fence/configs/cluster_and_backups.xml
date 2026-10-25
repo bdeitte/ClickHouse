@@ -1,0 +1,26 @@
+<clickhouse>
+    <!-- For an `ON CLUSTER` query that the fence refuses in the distributed DDL queue of the node. -->
+    <remote_servers>
+        <fence_cluster>
+            <shard>
+                <replica>
+                    <host>node</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </fence_cluster>
+    </remote_servers>
+    <!-- For a `BACKUP` of a table that the fence refuses. -->
+    <storage_configuration>
+        <disks>
+            <backups>
+                <type>local</type>
+                <path>/backups/</path>
+            </backups>
+        </disks>
+    </storage_configuration>
+    <backups>
+        <allowed_disk>backups</allowed_disk>
+        <allowed_path>/backups/</allowed_path>
+    </backups>
+</clickhouse>

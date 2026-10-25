@@ -31,3 +31,9 @@ b unchanged
 case 10: a finish that a crash interrupted after the first move, with its write left
 exchanged
 
+case 11: the temporary file without a record
+no valid exchange record is next to it
+INCORRECT_FILE_NAME
+the temporary file is left
+
+not exchanged

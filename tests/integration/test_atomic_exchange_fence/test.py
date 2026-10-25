@@ -17,7 +17,7 @@ cluster = ClickHouseCluster(__file__)
 # Keeper path takes `{shard}` and `{replica}` from these macros, not from the `Replicated` database.
 node = cluster.add_instance(
     "node",
-    main_configs=["configs/exchange_emulation.xml"],
+    main_configs=["configs/exchange_emulation.xml", "configs/cluster_and_backups.xml"],
     with_zookeeper=True,
     stay_alive=True,
     macros={"shard": "shard1", "replica": "replica1"},
@@ -247,6 +247,7 @@ def test_fence_in_atomic_covers_the_two_tables(started_cluster):
         )
     assert "FAULT_INJECTED" in error
     assert "is left, so the next load finishes the exchange" in error
+    assert "stays in the distributed DDL queue of this server" in error
 
     # The DDL guard of each of the two tables refuses DDL on it before the query changes anything.
     for query in [
@@ -268,6 +269,12 @@ def test_fence_in_atomic_covers_the_two_tables(started_cluster):
         "RENAME TABLE fence_ordinary.t TO fence_atomic.a"
     )
     assert node.query("SELECT count() FROM fence_ordinary.t").strip() == "1"
+    # The metadata file of `a` is missing. Readers of the definition refuse the two tables, and `BACKUP`
+    # refuses them instead of leaving them out of the backup.
+    assert "UNFINISHED" in node.query_and_get_error("SHOW CREATE TABLE fence_atomic.a")
+    assert "UNFINISHED" in node.query_and_get_error(
+        "BACKUP TABLE fence_atomic.a TO Disk('backups', 'fence_a')"
+    )
     # The `ReplicatedMergeTree` table refuses an `ALTER` through an alias before it commits the change to Keeper.
     assert "UNFINISHED" in node.query_and_get_error(
         "ALTER TABLE fence_ordinary.a_alias ADD COLUMN z UInt8"
@@ -304,6 +311,21 @@ def test_fence_in_atomic_covers_the_two_tables(started_cluster):
     node.query("UNDROP TABLE fence_atomic.u")
     assert node.query("SELECT count() FROM fence_atomic.u").strip() == "1"
     node.query("DROP TABLE fence_atomic.c SYNC")
+    node.query("BACKUP TABLE fence_atomic.untouched TO Disk('backups', 'fence_untouched')")
+
+    # An `ON CLUSTER` query refused on one of the two tables stays in the distributed DDL queue and is retried
+    # until the restart, so the `ON CLUSTER` query after it waits. The timeout 0 returns without waiting.
+    node.query(
+        "CREATE TABLE IF NOT EXISTS fence_atomic.a ON CLUSTER fence_cluster (x UInt8)"
+        " ENGINE = MergeTree ORDER BY x",
+        settings={"distributed_ddl_task_timeout": 0},
+    )
+    assert "TIMEOUT_EXCEEDED" in node.query_and_get_error(
+        "CREATE TABLE fence_atomic.behind ON CLUSTER fence_cluster (x UInt8)"
+        " ENGINE = MergeTree ORDER BY x",
+        settings={"distributed_ddl_task_timeout": 3},
+    )
+    assert node.query("EXISTS TABLE fence_atomic.behind").strip() == "0"
 
     # A refresh whose exchange of the inner table is fenced. `DROP TABLE` of the view checks the names of
     # its inner tables before it shuts the view down, so the view keeps working.
@@ -351,6 +373,10 @@ def test_fence_in_atomic_covers_the_two_tables(started_cluster):
     files = metadata_files("fence_atomic")
     assert not any(name.startswith(".") for name in files)
     assert not any(name.endswith(".tmp_exchange") for name in files)
+    # The distributed DDL queue applies the retried query, which now finds `a`, and the query after it.
+    assert_eq_with_retry(
+        node, "EXISTS TABLE fence_atomic.behind", "1", retry_count=60
+    )
     node.query("ALTER TABLE fence_atomic.a ADD COLUMN z UInt8")
     # The load finished the exchange of the refresh, so the view shows the fresh table, and the drop of the view
     # also drops the temporary table that the fenced refresh could not drop.

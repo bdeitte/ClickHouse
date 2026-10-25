@@ -95,12 +95,16 @@ public:
     /// Waits for the moves of an exchange with a record, see `metadata_files_mutex`.
     time_t getObjectMetadataModificationTime(const String & object_name) const override;
 
+    /// Refuses the tables of an unfinished exchange, see `unfinished_exchanges`, instead of leaving them out of the backup.
+    std::vector<std::pair<ASTPtr, StoragePtr>> getTablesForBackup(const FilterByNameFunction & filter, const ContextPtr & local_context) const override;
+
 protected:
     /// Finishes the exchanges of metadata files that a crash interrupted, also when the server setting turns the emulation off,
     /// so that the setting can be turned off after a crash. Not on a read-only disk.
     bool finishInterruptedMetadataExchangesAtLoad() const override;
 
-    /// Waits for the moves of an exchange with a record, see `metadata_files_mutex`.
+    /// Waits for the moves of an exchange with a record, see `metadata_files_mutex`. Refuses the tables of an unfinished exchange,
+    /// or returns `nullptr` for them when `throw_on_error` is `false`.
     ASTPtr readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const override;
     /// Waits for the moves of an exchange with a record, see `metadata_files_mutex`.
     String readObjectMetadataFile(const String & object_name) const override;
