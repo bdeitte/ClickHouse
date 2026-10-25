@@ -172,6 +172,7 @@ static struct InitFiu
     REGULAR(database_atomic_exchange_probe_as_rename) \
     PAUSEABLE_ONCE(database_atomic_exchange_pause_after_first_move) \
     PAUSEABLE_ONCE(database_atomic_pause_before_reading_create_query) \
+    PAUSEABLE_ONCE(replicated_merge_tree_pause_before_applying_metadata_alter) \
     REGULAR(dummy_failpoint) \
     ONCE(system_log_pipeline_fail_after_smt_restore) \
     REGULAR(prefetched_reader_pool_failpoint) \

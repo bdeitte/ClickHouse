@@ -215,7 +215,7 @@ StoragePtr DatabaseAtomic::detachTable(ContextPtr /* context */, const String & 
     StoragePtr detached_table;
     {
         std::lock_guard lock(mutex);
-        assertTableHasNoUnfinishedExchangeUnlocked(name);
+        assertCanCommitMetadataChangeUnlocked(name);
         detached_table = DatabaseOrdinary::detachTableUnlocked(name);
         table_name_to_path.erase(name);
         detached_tables.emplace(detached_table->getStorageID().uuid, detached_table);
@@ -254,7 +254,7 @@ void DatabaseAtomic::dropTableImpl(ContextPtr local_context, const String & tabl
     auto db_disk = getDisk();
     {
         std::lock_guard lock(mutex);
-        assertTableHasNoUnfinishedExchangeUnlocked(table_name);
+        assertCanCommitMetadataChangeUnlocked(table_name);
         table = getTableUnlocked(table_name);
         table_metadata_path_drop = DatabaseCatalog::instance().getPathForDroppedMetadata(table->getStorageID());
 
@@ -415,8 +415,8 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
         db_lock = std::unique_lock{mutex};
     }
 
-    assertTableHasNoUnfinishedExchangeUnlocked(table_name);
-    other_db.assertTableHasNoUnfinishedExchangeUnlocked(to_table_name);
+    assertCanCommitMetadataChangeUnlocked(table_name);
+    other_db.assertCanCommitMetadataChangeUnlocked(to_table_name);
 
     if (!exchange)
         other_db.checkMetadataFilenameAvailabilityUnlocked(to_table_name);
@@ -532,7 +532,7 @@ void DatabaseAtomic::commitCreateTable(const ASTCreateQuery & query, const Stora
         if (query.getDatabase() != database_name)
             throw Exception(ErrorCodes::UNKNOWN_DATABASE, "Database was renamed to `{}`, cannot create table in `{}`",
                             database_name, query.getDatabase());
-        assertTableHasNoUnfinishedExchangeUnlocked(query.getTable());
+        assertCanCommitMetadataChangeUnlocked(query.getTable());
         /// Do some checks before renaming file from .tmp to .sql
         not_in_use = cleanupDetachedTables();
         assertDetachedTableNotInUse(query.uuid);
@@ -571,7 +571,7 @@ void DatabaseAtomic::commitAlterTable(const StorageID & table_id, const String &
     });
 
     std::lock_guard lock{mutex};
-    assertTableHasNoUnfinishedExchangeUnlocked(table_id.table_name);
+    assertCanCommitMetadataChangeUnlocked(table_id.table_name);
     auto actual_table_id = getTableUnlocked(table_id.table_name)->getStorageID();
 
     if (table_id.uuid != actual_table_id.uuid)
@@ -589,15 +589,26 @@ void DatabaseAtomic::commitAlterTable(const StorageID & table_id, const String &
         db_disk->replaceFile(table_metadata_tmp_path, table_metadata_path);
 }
 
-void DatabaseAtomic::checkNoUnfinishedExchange(const String & table_name) const
+void DatabaseAtomic::assertNoUnfinishedExchangeInDatabaseUnlocked() const
 {
-    std::lock_guard lock{mutex};
     if (unfinished_exchange_in_database)
         throw Exception(ErrorCodes::UNFINISHED,
                         "An exchange of {} in database {} failed and could not be finished, so DDL on the database, and the other "
                         "queries that it replicates through its log, such as mutations, lightweight `DELETE` and `UPDATE` "
                         "and `TRUNCATE`, fail until the server restarts. {}",
                         unfinished_exchange_in_database->files, backQuote(database_name), unfinished_exchange_in_database->hint);
+}
+
+void DatabaseAtomic::assertCanCommitMetadataChangeUnlocked(const String & table_name) const
+{
+    assertNoUnfinishedExchangeInDatabaseUnlocked();
+    assertTableHasNoUnfinishedExchangeUnlocked(table_name);
+}
+
+void DatabaseAtomic::checkNoUnfinishedExchange(const String & table_name) const
+{
+    std::lock_guard lock{mutex};
+    assertNoUnfinishedExchangeInDatabaseUnlocked();
     if (table_name.empty() && !unfinished_exchanges.empty())
     {
         const auto & [_, exchange] = *unfinished_exchanges.begin();

@@ -550,6 +550,9 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query, 
 
     /// Before anything below changes the database or its tables. The guards of the tables, taken below, check each table
     /// only after the tables are prepared for shutdown. `TRUNCATE ALL TABLES` only truncates data, so it does not need the check.
+    /// A refresh of a view that is running now can still fail its exchange after this check. The query then prepares every table
+    /// for shutdown, drops or detaches tables until the guard of a table of the exchange throws `UNFINISHED`, and leaves the rest
+    /// of the tables prepared for shutdown, so the database is half dropped or detached.
     if (!truncate || !query.has_tables)
         database->checkNoUnfinishedExchange(/* table_name */ "");
 

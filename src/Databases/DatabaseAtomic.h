@@ -160,11 +160,14 @@ private:
         bool fsync,
         bool has_keeper_transaction) TSA_NO_THREAD_SAFETY_ANALYSIS;
 
-    /// Throws `UNFINISHED` while an exchange of the metadata file of `table_name` could not be finished. The operations
-    /// that change metadata files call it under `mutex`, after `checkNoUnfinishedExchange` passed when the DDL guard was taken.
-    /// It does not check `unfinished_exchange_in_database`: an operation that started before an exchange of other tables failed
-    /// finishes, as it would have if it had been a moment faster.
+    /// Throws `UNFINISHED` while an exchange of the metadata file of `table_name` could not be finished.
     void assertTableHasNoUnfinishedExchangeUnlocked(const String & table_name) const TSA_REQUIRES(mutex);
+    /// Throws `UNFINISHED` while `unfinished_exchange_in_database` is set.
+    void assertNoUnfinishedExchangeInDatabaseUnlocked() const TSA_REQUIRES(mutex);
+    /// Called under `mutex` by the operations that change metadata files, before they commit, after `checkNoUnfinishedExchange`
+    /// passed when the DDL guard was taken. In `Atomic`, an operation on another table that started before an exchange failed
+    /// finishes, as it would have if it had been a moment faster. In `Replicated`, it is refused, see `unfinished_exchange_in_database`.
+    void assertCanCommitMetadataChangeUnlocked(const String & table_name) const TSA_REQUIRES(mutex);
 
     struct UnfinishedExchange
     {
@@ -183,9 +186,12 @@ private:
     /// that the database replicates through its log, such as a mutation or `TRUNCATE`, fails until a restart: the digest of
     /// the database reads every metadata file, so it does not match while two of them are half exchanged. A query that is
     /// not replicated through the log, such as a mutation of `ReplicatedMergeTree` in a database with one shard, is not refused.
-    /// `DDLWorker` runs the queries of the database one at a time, so the fence cannot appear between the check and the commit
-    /// of another query. A background `ALTER_METADATA` of `ReplicatedMergeTree` commits its Keeper changes in `commitAlterTable`,
-    /// with the metadata file, so it commits both or neither.
+    /// A change of metadata that commits after the fence is refused too, see `assertCanCommitMetadataChangeUnlocked`: after a failed
+    /// exchange, `tables_metadata_digest` still holds the digest before the exchange while Keeper holds the one after it, so the
+    /// change would write a digest to Keeper that hides the exchange from the check that recovers the replica at the next start.
+    /// `DDLWorker` runs the queries of the database one at a time, but a background `ALTER_METADATA` of `ReplicatedMergeTree` can
+    /// pass its DDL guard before the fence and reach `commitAlterTable` after it. It commits its Keeper changes there, with the
+    /// metadata file, so it commits both or neither, and retries the entry after the restart.
     std::optional<UnfinishedExchange> unfinished_exchange_in_database TSA_GUARDED_BY(mutex);
 
     /// Held exclusively by `exchangeMetadataFilesWithRecord` while it moves the metadata files, and shared by the readers

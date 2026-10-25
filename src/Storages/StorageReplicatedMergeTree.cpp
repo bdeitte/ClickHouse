@@ -256,6 +256,7 @@ namespace MergeTreeSetting
 namespace FailPoints
 {
     extern const char replicated_queue_fail_next_entry[];
+    extern const char replicated_merge_tree_pause_before_applying_metadata_alter[];
     extern const char replicated_queue_unfail_entries[];
     extern const char finish_set_quorum_failed_parts[];
     extern const char zero_copy_lock_zk_fail_before_op[];
@@ -6894,6 +6895,9 @@ bool StorageReplicatedMergeTree::executeMetadataAlter(const StorageReplicatedMer
         }
         auto table_lock_holder = lockForShare(RWLockImpl::NO_QUERY, (*getSettings())[MergeTreeSetting::lock_acquire_timeout_for_background_operations]);
         auto alter_lock_holder = lockForAlter((*getSettings())[MergeTreeSetting::lock_acquire_timeout_for_background_operations]);
+
+        /// Lets a test hold the entry between its DDL guard and its commit, while an exchange in the database fails.
+        FailPointInjection::pauseFailPoint(FailPoints::replicated_merge_tree_pause_before_applying_metadata_alter);
 
         /// Refresh table_id: a rename could have slipped in while we were waiting for the guard.
         auto table_id = getStorageID();

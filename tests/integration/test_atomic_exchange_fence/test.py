@@ -90,17 +90,49 @@ def test_fence_until_restart(started_cluster):
         "CREATE TABLE fence_db.plain (x UInt8) ENGINE = MergeTree ORDER BY x",
         settings={"distributed_ddl_output_mode": "none"},
     )
+    # A replica of `held` on `node2`, outside the database, sends an `ALTER_METADATA` entry to `held`.
+    node.query(
+        "CREATE TABLE fence_db.held (x UInt8) ENGINE = ReplicatedMergeTree ORDER BY x"
+    )
+    held_path = node.query(
+        "SELECT zookeeper_path FROM system.replicas"
+        " WHERE database = 'fence_db' AND table = 'held'"
+    ).strip()
+    node2.query(
+        "CREATE TABLE default.fence_held (x UInt8)"
+        f" ENGINE = ReplicatedMergeTree('{held_path}', 'node2') ORDER BY x"
+    )
 
-    with failpoints_enabled(
-        [
-            "database_atomic_exchange_with_record",
-            "database_atomic_exchange_always_fail_before_first_move",
-        ]
-    ):
-        error = node.query_and_get_error(
-            "EXCHANGE TABLES fence_db.a AND fence_db.b",
-            settings={"distributed_ddl_output_mode": "none"},
+    # The entry passes its DDL guard before the exchange fails, and reaches its commit after it. The commit is
+    # refused: the in-memory digest of the database is still the one before the exchange, while Keeper holds
+    # the one after it, so the commit would write a digest that hides the exchange from the recovery at restart.
+    with failpoints_enabled(["replicated_merge_tree_pause_before_applying_metadata_alter"]):
+        node2.query("ALTER TABLE default.fence_held ADD COLUMN w UInt8")
+        node.query(
+            "SYSTEM WAIT FAILPOINT replicated_merge_tree_pause_before_applying_metadata_alter PAUSE"
         )
+        with failpoints_enabled(
+            [
+                "database_atomic_exchange_with_record",
+                "database_atomic_exchange_always_fail_before_first_move",
+            ]
+        ):
+            error = node.query_and_get_error(
+                "EXCHANGE TABLES fence_db.a AND fence_db.b",
+                settings={"distributed_ddl_output_mode": "none"},
+            )
+        node.query(
+            "SYSTEM NOTIFY FAILPOINT replicated_merge_tree_pause_before_applying_metadata_alter"
+        )
+    assert_eq_with_retry(
+        node,
+        "SELECT count() FROM system.replication_queue"
+        " WHERE database = 'fence_db' AND table = 'held' AND type = 'ALTER_METADATA'"
+        " AND last_exception LIKE '%UNFINISHED%'",
+        "1",
+        retry_count=60,
+    )
+    assert has_column("fence_db", "held", "w") == "0"
     assert "FAULT_INJECTED" in error
     # Without the temporary file, the restart leaves the repair to the replica recovery from Keeper,
     # which moves exchanged tables that do not support replication to the broken-tables database.
@@ -143,7 +175,7 @@ def test_fence_until_restart(started_cluster):
             "SELECT groupArray(name) FROM"
             " (SELECT name FROM system.tables WHERE database = 'fence_db' ORDER BY name)"
         ).strip()
-        == "['a','b','plain','untouched']"
+        == "['a','b','held','plain','untouched']"
     )
     assert has_column("fence_db", "plain", "z") == "0"
     assert has_column("fence_db", "untouched", "z") == "0"
@@ -180,6 +212,14 @@ def test_fence_until_restart(started_cluster):
         retry_count=60,
     )
     assert has_column("fence_db", "b", "y") == "0"
+    # The entry refused at its commit is applied after the restart.
+    assert_eq_with_retry(
+        node,
+        "SELECT count() FROM system.columns"
+        " WHERE database = 'fence_db' AND table = 'held' AND name = 'w'",
+        "1",
+        retry_count=60,
+    )
     # Keeper did not get the refused `ALTER`, so the repair does not add its column.
     assert has_column("fence_db", "untouched", "z") == "0"
     assert node.query("SELECT count() FROM fence_db.a").strip() == "1"
@@ -196,6 +236,7 @@ def test_fence_until_restart(started_cluster):
     # on the module-scoped cluster.
     node.query("DROP DATABASE IF EXISTS fence_db_broken_tables SYNC")
     node.query("DROP DATABASE IF EXISTS fence_db_broken_replicated_tables SYNC")
+    node2.query("DROP TABLE default.fence_held SYNC")
 
 
 def test_fence_in_atomic_covers_the_two_tables(started_cluster):
