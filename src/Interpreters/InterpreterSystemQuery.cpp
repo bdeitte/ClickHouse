@@ -198,6 +198,7 @@ namespace ErrorCodes
     extern const int DELTA_KERNEL_ERROR;
     extern const int FAULT_INJECTED;
     extern const int QUERY_WAS_CANCELLED;
+    extern const int UNFINISHED;
 }
 
 namespace FailPoints
@@ -1492,7 +1493,20 @@ void InterpreterSystemQuery::restoreDatabaseReplica(ASTSystemQuery & query)
 StoragePtr InterpreterSystemQuery::doRestartReplica(const StorageID & replica, ContextMutablePtr system_context, bool throw_on_error)
 {
     LOG_TRACE(log, "Restarting replica {}", replica);
-    auto table_ddl_guard = DatabaseCatalog::instance().getDDLGuard(replica.getDatabaseName(), replica.getTableName(), nullptr);
+    /// The guard refuses a table whose metadata file an unfinished exchange left, before the table is shut down.
+    /// `SYSTEM RESTART REPLICAS` skips such a table, like the other tables it cannot restart.
+    DDLGuardPtr table_ddl_guard;
+    try
+    {
+        table_ddl_guard = DatabaseCatalog::instance().getDDLGuard(replica.getDatabaseName(), replica.getTableName(), nullptr);
+    }
+    catch (const Exception & e)
+    {
+        if (throw_on_error || e.code() != ErrorCodes::UNFINISHED)
+            throw;
+        LOG_WARNING(getLogger("InterpreterSystemQuery"), "Cannot RESTART REPLICA {}: {}", replica.getNameForLogs(), e.message());
+        return nullptr;
+    }
 
     auto restart_replica_lock = DatabaseCatalog::instance().tryGetLockForRestartReplica(replica.getDatabaseName());
     if (!restart_replica_lock)
@@ -1535,19 +1549,6 @@ StoragePtr InterpreterSystemQuery::doRestartReplica(const StorageID & replica, C
         if (throw_on_error)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, table_is_not_replicated.data(), replica.getNameForLogs());
         LOG_WARNING(getLogger("InterpreterSystemQuery"), "Cannot RESTART REPLICA {}: not a ReplicatedMergeTree anymore", replica.getNameForLogs());
-        return nullptr;
-    }
-
-    /// Before the table is shut down, so that a database which refuses to detach its tables leaves it working.
-    try
-    {
-        database->checkTablesCanBeDroppedOrDetached();
-    }
-    catch (const Exception & e)
-    {
-        if (throw_on_error)
-            throw;
-        LOG_WARNING(getLogger("InterpreterSystemQuery"), "Cannot RESTART REPLICA {}: {}", replica.getNameForLogs(), e.message());
         return nullptr;
     }
 

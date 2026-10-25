@@ -66,9 +66,11 @@ $CLIENT -q "
 "
 set_metadata_dir "$DB_ATOMIC" DIR_ATOMIC
 
-# The metadata of the databases is not on the local filesystem (for example, a `database_disk` on object storage),
-# where exchanges never use a record. The directory of a database exists once it has a table.
-if [ ! -d "$DIR_ATOMIC" ]
+# Exchanges never use a record when the server setting turns the emulation off, or when the metadata of the databases
+# is not on the local filesystem (for example, a `database_disk` on object storage). The directory of a database exists
+# once it has a table.
+EMULATION=$($CLICKHOUSE_CLIENT -q "SELECT value FROM system.server_settings WHERE name = 'database_atomic_allow_exchange_emulation'")
+if [ "$EMULATION" != "1" ] || [ ! -d "$DIR_ATOMIC" ]
 then
     cat "${BASH_SOURCE[0]%.sh}.reference"
     exit 0

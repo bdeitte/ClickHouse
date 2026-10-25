@@ -1,0 +1,21 @@
+the database with the record attached first
+db1	a	x,y
+db1 records: 0
+db2 records: 1
+db1	a	x,y
+db2	b	x
+db1 records: 0
+db2 records: 0
+data	2	3
+data	1
+
+the database with the copy of the record attached first
+db2	b	x
+db1 records: 1
+db2 records: 0
+db1	a	x,y
+db2	b	x
+db1 records: 0
+db2 records: 0
+data	2	3
+data	1

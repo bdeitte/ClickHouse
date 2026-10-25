@@ -553,25 +553,12 @@ public:
 
     virtual void assertCanBeDetached(bool /*cleanup*/) {}
 
-    /// Called by `DROP`, `DETACH` and `TRUNCATE DATABASE`, before replication is stopped or any table is prepared,
-    /// so that a database which refuses to detach its tables fails the query before it changes anything.
-    /// Not called by `TRUNCATE ALL TABLES`, which keeps the tables attached.
-    virtual void checkCanBeDroppedOrDetached() const {}
-
-    /// Called by `DROP TABLE` and `DETACH TABLE`, before the table is shut down or its dependencies are removed,
-    /// and by the recovery of a `Replicated` replica before it creates the broken-tables databases or shuts down any table,
-    /// so that a database which refuses to drop or detach any of its tables fails the query before it changes anything.
-    virtual void checkTablesCanBeDroppedOrDetached() const {}
-
-    /// Called by `CREATE` and `ATTACH` before the storage is built, by `UNDROP` before the metadata file moves back,
-    /// and by a move of a table from a database of another engine before the source table is detached and its data moves,
-    /// so that a database which refuses to create tables fails the query before it changes anything.
-    virtual void checkTablesCanBeCreated() const {}
-
-    /// Called by an `ALTER` that changes the metadata of a table, before the query is replicated, and by `ReplicatedMergeTree`
-    /// before it commits the change to Keeper ahead of the metadata file, either for its own `ALTER` or for an `ALTER_METADATA`
-    /// entry from another replica, so that a database which refuses to alter its tables fails the query before it changes anything.
-    virtual void checkTablesCanBeAltered() const {}
+    /// Throws while an exchange of the metadata file of `table_name` failed and could not be finished, until the server restarts.
+    /// With an empty `table_name`, throws while this is so for any table of the database.
+    /// `DatabaseCatalog::getDDLGuard` calls it for the name it guards, before the query changes anything. An exchange sets this
+    /// state only while it holds the DDL guards of both of its names, so the answer stays true for as long as the guard is held.
+    /// `DROP`, `DETACH` and `TRUNCATE DATABASE` and the recovery of a `Replicated` replica call it with an empty name.
+    virtual void checkNoUnfinishedExchange(const String & /*table_name*/) const {}
 
     virtual void waitDetachedTableNotInUse(const UUID & /*uuid*/, std::function<void()> /*throw_if_cancelled*/) { }
     virtual void checkDetachedTableNotInUse(const UUID & /*uuid*/) { }

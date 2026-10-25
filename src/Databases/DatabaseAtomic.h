@@ -7,6 +7,7 @@
 #include <Storages/IStorage_fwd.h>
 #include <Common/SharedMutex.h>
 
+#include <map>
 #include <mutex>
 #include <optional>
 
@@ -68,9 +69,6 @@ public:
 
     void beforeLoadingMetadata(ContextMutablePtr context, LoadingStrictnessLevel mode) override;
 
-    /// Finishes the exchanges of metadata files that a crash interrupted, then loads the metadata.
-    void loadTablesMetadata(ContextPtr local_context, ParsedTablesMetadata & metadata, bool is_startup) override;
-
     /// Whether an exchange of metadata files on `disk` can be done with three moves and a record when the disk has no atomic exchange.
     static bool canEmulateExchange(const DiskPtr & disk);
 
@@ -81,17 +79,9 @@ public:
     /// Atomic database cannot be detached if there is detached table which still in use
     void assertCanBeDetached(bool cleanup) override;
 
-    /// Throws `UNFINISHED` while an exchange of metadata files in the database could not be finished.
-    void checkCanBeDroppedOrDetached() const override;
-
-    /// Throws `UNFINISHED` while an exchange of metadata files in the database could not be finished.
-    void checkTablesCanBeDroppedOrDetached() const override;
-
-    /// Throws `UNFINISHED` while an exchange of metadata files in the database could not be finished.
-    void checkTablesCanBeCreated() const override;
-
-    /// Throws `UNFINISHED` while an exchange of metadata files in the database could not be finished.
-    void checkTablesCanBeAltered() const override;
+    /// Throws `UNFINISHED` while an exchange of the metadata file of `table_name` could not be finished,
+    /// or, in `Replicated`, while an exchange of any metadata file of the database could not be finished.
+    void checkNoUnfinishedExchange(const String & table_name) const override;
 
     UUID tryGetTableUUID(const String & table_name) const override;
 
@@ -106,6 +96,10 @@ public:
     time_t getObjectMetadataModificationTime(const String & object_name) const override;
 
 protected:
+    /// Finishes the exchanges of metadata files that a crash interrupted, also when the server setting turns the emulation off,
+    /// so that the setting can be turned off after a crash. Not on a read-only disk.
+    bool finishInterruptedMetadataExchangesAtLoad() const override;
+
     /// Waits for the moves of an exchange with a record, see `metadata_files_mutex`.
     ASTPtr readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const override;
     /// Waits for the moves of an exchange with a record, see `metadata_files_mutex`.
@@ -148,24 +142,45 @@ private:
     /// Exchanges the two metadata files of `record` with three moves, instead of an atomic exchange,
     /// and removes the records at `record_paths` that `writeMetadataExchangeRecords` wrote before the Keeper commit.
     /// When a move throws, it reads the files and rolls the exchange forward from the record. When it cannot,
-    /// it keeps the records, sets `unfinished_exchange` and `unfinished_exchange_hint` on both databases and rethrows.
-    /// `has_keeper_transaction` tells that the Keeper commit ran. The caller holds `mutex` of both databases.
+    /// it keeps the records, sets `unfinished_exchanges` for `table_name` in this database and `other_table_name` in `other_db`,
+    /// and `unfinished_exchange_in_database` in `Replicated`, and rethrows.
+    /// `has_keeper_transaction` tells that the Keeper commit ran. The caller holds `mutex` of both databases,
+    /// and the DDL guards of both names.
     void exchangeMetadataFilesWithRecord(
         DatabaseAtomic & other_db,
+        const String & table_name,
+        const String & other_table_name,
         const DiskPtr & disk,
         const MetadataExchangeRecord & record,
         const Strings & record_paths,
         bool fsync,
         bool has_keeper_transaction) TSA_NO_THREAD_SAFETY_ANALYSIS;
 
-    void assertNoUnfinishedExchangeUnlocked() const TSA_REQUIRES(mutex);
+    /// Throws `UNFINISHED` while an exchange of the metadata file of `table_name` could not be finished. The operations
+    /// that change metadata files call it under `mutex`, after `checkNoUnfinishedExchange` passed when the DDL guard was taken.
+    /// It does not check `unfinished_exchange_in_database`: an operation that started before an exchange of other tables failed
+    /// finishes, as it would have if it had been a moment faster.
+    void assertTableHasNoUnfinishedExchangeUnlocked(const String & table_name) const TSA_REQUIRES(mutex);
 
-    /// Set when an exchange failed and could not be finished, so the metadata files may be half exchanged.
-    /// DDL on the database fails until a restart. The next load finishes an interrupted exchange from its record,
+    struct UnfinishedExchange
+    {
+        /// The two metadata files of the exchange.
+        String files;
+        /// What the restart does about the exchange, for the error of DDL until then.
+        String hint;
+    };
+
+    /// Set when an exchange failed and could not be finished, so the metadata files of its two tables may be half exchanged.
+    /// DDL on the two tables fails until a restart. The next load finishes an interrupted exchange from its record,
     /// or reports `CORRUPTED_DATA` when it cannot. In `Replicated`, the replica recovery from Keeper repairs files that are behind Keeper.
-    String unfinished_exchange TSA_GUARDED_BY(mutex);
-    /// What the restart does about the unfinished exchange, for the error of DDL until then.
-    String unfinished_exchange_hint TSA_GUARDED_BY(mutex);
+    /// `DROP`, `DETACH` and `TRUNCATE DATABASE` fail too. By table name.
+    std::map<String, UnfinishedExchange> unfinished_exchanges TSA_GUARDED_BY(mutex);
+    /// Set in `Replicated` with `unfinished_exchanges`, so that DDL on every table of the database fails until a restart:
+    /// the digest of the database reads every metadata file, so it does not match while two of them are half exchanged.
+    /// `DDLWorker` runs the queries of the database one at a time, so the fence cannot appear between the check and the commit
+    /// of another query. A background `ALTER_METADATA` of `ReplicatedMergeTree` commits its Keeper changes in `commitAlterTable`,
+    /// with the metadata file, so it commits both or neither.
+    std::optional<UnfinishedExchange> unfinished_exchange_in_database TSA_GUARDED_BY(mutex);
 
     /// Held exclusively by `exchangeMetadataFilesWithRecord` while it moves the metadata files, and shared by the readers
     /// of metadata files that do not take `mutex`, such as `SHOW CREATE TABLE`, `system.tables`, `BACKUP`, `ALTER`

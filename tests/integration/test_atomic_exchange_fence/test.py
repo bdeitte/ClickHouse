@@ -1,10 +1,13 @@
+from contextlib import contextmanager
+
 import pytest
 
 from helpers.cluster import ClickHouseCluster
 from helpers.test_tools import assert_eq_with_retry
 
 # When an exchange of metadata files with a record fails after the Keeper commit and cannot be rolled
-# forward from the record, the database fences its DDL until a restart. This needs a restart to recover,
+# forward from the record, DDL on the two tables is fenced until a restart, and in a `Replicated` database
+# DDL on every table, because its digest reads every metadata file. This needs a restart to recover,
 # so a stateless test cannot cover it. The failpoint `database_atomic_exchange_with_record` forces the
 # record path, and other failpoints fail the moves of the exchange and the handling of the failure.
 
@@ -31,6 +34,18 @@ def started_cluster():
         yield cluster
     finally:
         cluster.shutdown()
+
+
+@contextmanager
+def failpoints_enabled(failpoints):
+    # The failpoints are server-wide, so a failed assertion must not leave them enabled for the next tests.
+    try:
+        for failpoint in failpoints:
+            node.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+        yield
+    finally:
+        for failpoint in failpoints:
+            node.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
 
 
 def metadata_files(database):
@@ -76,22 +91,20 @@ def test_fence_until_restart(started_cluster):
         settings={"distributed_ddl_output_mode": "none"},
     )
 
-    node.query("SYSTEM ENABLE FAILPOINT database_atomic_exchange_with_record")
-    node.query(
-        "SYSTEM ENABLE FAILPOINT database_atomic_exchange_always_fail_before_first_move"
-    )
-    error = node.query_and_get_error(
-        "EXCHANGE TABLES fence_db.a AND fence_db.b",
-        settings={"distributed_ddl_output_mode": "none"},
-    )
+    with failpoints_enabled(
+        [
+            "database_atomic_exchange_with_record",
+            "database_atomic_exchange_always_fail_before_first_move",
+        ]
+    ):
+        error = node.query_and_get_error(
+            "EXCHANGE TABLES fence_db.a AND fence_db.b",
+            settings={"distributed_ddl_output_mode": "none"},
+        )
     assert "FAULT_INJECTED" in error
     # Without the temporary file, the restart leaves the repair to the replica recovery from Keeper,
     # which moves exchanged tables that do not support replication to the broken-tables database.
     assert "`fence_db_broken_tables`" in error
-    node.query(
-        "SYSTEM DISABLE FAILPOINT database_atomic_exchange_always_fail_before_first_move"
-    )
-    node.query("SYSTEM DISABLE FAILPOINT database_atomic_exchange_with_record")
 
     # Keeper holds the exchange, while the local files and tables do not.
     assert has_column("fence_db", "a", "y") == "0"
@@ -178,7 +191,7 @@ def test_fence_until_restart(started_cluster):
     node.query("DROP DATABASE IF EXISTS fence_db_broken_replicated_tables SYNC")
 
 
-def test_fence_refuses_move_from_ordinary(started_cluster):
+def test_fence_in_atomic_covers_the_two_tables(started_cluster):
     # An `Atomic` database has no Keeper commit, so a failed retry fails cleanly. The fence needs a move
     # that fails after the first move, and a roll forward from the record that fails too.
     node.query("CREATE DATABASE fence_atomic ENGINE = Atomic")
@@ -186,126 +199,171 @@ def test_fence_refuses_move_from_ordinary(started_cluster):
         "CREATE DATABASE fence_ordinary ENGINE = Ordinary",
         settings={"allow_deprecated_database_ordinary": 1},
     )
-    node.query("CREATE TABLE fence_atomic.a (x UInt8) ENGINE = MergeTree ORDER BY x")
+    # `ReplicatedMergeTree`, so that the fence is checked before the tables commit a change to Keeper.
     node.query(
-        "CREATE TABLE fence_atomic.b (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x"
+        "CREATE TABLE fence_atomic.a (x UInt8)"
+        " ENGINE = ReplicatedMergeTree('/clickhouse/tables/fence_atomic_a', 'r1') ORDER BY x"
+    )
+    node.query(
+        "CREATE TABLE fence_atomic.b (x UInt8, y UInt8)"
+        " ENGINE = ReplicatedMergeTree('/clickhouse/tables/fence_atomic_b', 'r1') ORDER BY x"
+    )
+    node.query("INSERT INTO fence_atomic.a VALUES (1)")
+    # Not part of the exchange: the fence does not cover it.
+    node.query(
+        "CREATE TABLE fence_atomic.untouched (x UInt8) ENGINE = MergeTree ORDER BY x"
     )
     node.query("CREATE TABLE fence_ordinary.t (x UInt8) ENGINE = MergeTree ORDER BY x")
     node.query("INSERT INTO fence_ordinary.t VALUES (1)")
-    # An `ALTER` through an alias in another database reaches the `ReplicatedMergeTree` table without
-    # the check of `InterpreterAlterQuery`, which checks only the database of the alias.
+    # An `ALTER` through an alias in another database reaches `a` through the DDL guard of `a`.
     node.query(
-        "CREATE TABLE fence_atomic.r (x UInt8)"
-        " ENGINE = ReplicatedMergeTree('/clickhouse/tables/fence_atomic_r', 'r1') ORDER BY x"
+        "CREATE TABLE fence_ordinary.a_alias ENGINE = Alias('fence_atomic', 'a')"
     )
+    # A second replica outside the fenced database sends `ALTER_METADATA` entries to `a`.
     node.query(
-        "CREATE TABLE fence_ordinary.r_alias ENGINE = Alias('fence_atomic', 'r')"
+        "CREATE TABLE fence_ordinary.a2 (x UInt8)"
+        " ENGINE = ReplicatedMergeTree('/clickhouse/tables/fence_atomic_a', 'r2') ORDER BY x"
     )
-    # A second replica outside the fenced database sends `ALTER_METADATA` entries to `r`.
+    # A refreshable materialized view with an inner table, which a refresh exchanges with a fresh table.
+    # `EMPTY` and the long period keep it from refreshing until `SYSTEM REFRESH VIEW`.
     node.query(
-        "CREATE TABLE fence_ordinary.r2 (x UInt8)"
-        " ENGINE = ReplicatedMergeTree('/clickhouse/tables/fence_atomic_r', 'r2') ORDER BY x"
+        "CREATE MATERIALIZED VIEW fence_atomic.mv REFRESH EVERY 1 YEAR"
+        " (x UInt8) ENGINE = MergeTree ORDER BY x EMPTY AS SELECT 1 AS x"
     )
-    # A table dropped before the fence, for `UNDROP` into the fenced database.
+    # A table dropped before the fence, for `UNDROP` into the database during the fence.
     node.query("CREATE TABLE fence_atomic.u (x UInt8) ENGINE = MergeTree ORDER BY x")
     node.query("INSERT INTO fence_atomic.u VALUES (1)")
     node.query("DROP TABLE fence_atomic.u")
 
-    failpoints = [
-        "database_atomic_exchange_with_record",
-        "database_atomic_exchange_fail_after_first_move",
-        "database_atomic_exchange_fail_to_finish",
-    ]
-    for failpoint in failpoints:
-        node.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
-    error = node.query_and_get_error(
-        "EXCHANGE TABLES fence_atomic.a AND fence_atomic.b"
-    )
-    for failpoint in failpoints:
-        node.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+    with failpoints_enabled(
+        [
+            "database_atomic_exchange_with_record",
+            "database_atomic_exchange_fail_after_first_move",
+            "database_atomic_exchange_fail_to_finish",
+        ]
+    ):
+        error = node.query_and_get_error(
+            "EXCHANGE TABLES fence_atomic.a AND fence_atomic.b"
+        )
     assert "FAULT_INJECTED" in error
     assert "is left, so the next load finishes the exchange" in error
 
-    # Moving a table from `Ordinary` into the fenced database is refused before the table is detached
+    # The DDL guard of each of the two tables refuses DDL on it before the query changes anything.
+    for query in [
+        "DROP TABLE fence_atomic.a",
+        "DETACH TABLE fence_atomic.b",
+        "ALTER TABLE fence_atomic.b ADD COLUMN z UInt8",
+        "RENAME TABLE fence_atomic.untouched TO fence_atomic.a",
+        "EXCHANGE TABLES fence_atomic.b AND fence_atomic.untouched",
+        "SYSTEM RESTART REPLICA fence_atomic.a",
+        "DROP DATABASE fence_atomic",
+    ]:
+        assert "UNFINISHED" in node.query_and_get_error(query), query
+    # The tables were not shut down, so inserts still succeed.
+    node.query("INSERT INTO fence_atomic.a VALUES (2)")
+    assert node.query("SELECT count() FROM fence_atomic.a").strip() == "2"
+    # Moving a table from `Ordinary` to one of the two names is refused before the table is detached
     # and its data moves, so the table stays in `Ordinary` with its data.
     assert "UNFINISHED" in node.query_and_get_error(
-        "RENAME TABLE fence_ordinary.t TO fence_atomic.t"
+        "RENAME TABLE fence_ordinary.t TO fence_atomic.a"
     )
     assert node.query("SELECT count() FROM fence_ordinary.t").strip() == "1"
-    # The `ReplicatedMergeTree` table refuses the `ALTER` before it commits the change to Keeper.
+    # The `ReplicatedMergeTree` table refuses an `ALTER` through an alias before it commits the change to Keeper.
     assert "UNFINISHED" in node.query_and_get_error(
-        "ALTER TABLE fence_ordinary.r_alias ADD COLUMN z UInt8"
+        "ALTER TABLE fence_ordinary.a_alias ADD COLUMN z UInt8"
     )
     keeper_columns = node.query(
         "SELECT value FROM system.zookeeper"
-        " WHERE path = '/clickhouse/tables/fence_atomic_r' AND name = 'columns'"
+        " WHERE path = '/clickhouse/tables/fence_atomic_a' AND name = 'columns'"
     )
     assert "`x` UInt8" in keeper_columns
     assert "`z`" not in keeper_columns
-    # A `CREATE` is refused before the storage is built, which creates the replica of a
-    # `ReplicatedMergeTree` table in Keeper.
-    create_c = (
-        "CREATE TABLE fence_atomic.c (x UInt8)"
-        " ENGINE = ReplicatedMergeTree('/clickhouse/tables/fence_atomic_c', 'r1') ORDER BY x"
-    )
-    assert "UNFINISHED" in node.query_and_get_error(create_c)
-    assert (
-        node.query(
-            "SELECT count() FROM system.zookeeper"
-            " WHERE path = '/clickhouse/tables' AND name = 'fence_atomic_c'"
-        ).strip()
-        == "0"
-    )
-    # `UNDROP` is refused before the table leaves the dropped-table queue, so it can be repeated.
-    for _ in range(2):
-        assert "UNFINISHED" in node.query_and_get_error("UNDROP TABLE fence_atomic.u")
-    # The replica `r` refuses the `ALTER_METADATA` entry of `r2` before it changes its own metadata
+    # The replica `a` refuses the `ALTER_METADATA` entry of `a2` before it changes its own metadata
     # nodes in Keeper, and retries it until the restart.
-    node.query("ALTER TABLE fence_ordinary.r2 ADD COLUMN w UInt8")
+    node.query("ALTER TABLE fence_ordinary.a2 ADD COLUMN w UInt8")
     assert_eq_with_retry(
         node,
         "SELECT count() FROM system.replication_queue"
-        " WHERE database = 'fence_atomic' AND table = 'r' AND type = 'ALTER_METADATA'"
+        " WHERE database = 'fence_atomic' AND table = 'a' AND type = 'ALTER_METADATA'"
         " AND last_exception LIKE '%UNFINISHED%'",
         "1",
         retry_count=60,
     )
     replica_columns = node.query(
         "SELECT value FROM system.zookeeper"
-        " WHERE path = '/clickhouse/tables/fence_atomic_r/replicas/r1' AND name = 'columns'"
+        " WHERE path = '/clickhouse/tables/fence_atomic_a/replicas/r1' AND name = 'columns'"
     )
     assert "`w`" not in replica_columns
 
+    # DDL on the other tables of the database goes on.
+    node.query("ALTER TABLE fence_atomic.untouched ADD COLUMN z UInt8")
+    assert has_column("fence_atomic", "untouched", "z") == "1"
+    node.query("CREATE TABLE fence_atomic.c (x UInt8) ENGINE = MergeTree ORDER BY x")
+    node.query("RENAME TABLE fence_ordinary.t TO fence_atomic.t")
+    assert node.query("SELECT count() FROM fence_atomic.t").strip() == "1"
+    node.query("UNDROP TABLE fence_atomic.u")
+    assert node.query("SELECT count() FROM fence_atomic.u").strip() == "1"
+    node.query("DROP TABLE fence_atomic.c SYNC")
+
+    # A refresh whose exchange of the inner table is fenced. `DROP TABLE` of the view checks the names of
+    # its inner tables before it shuts the view down, so the view keeps working.
+    with failpoints_enabled(
+        [
+            "database_atomic_exchange_with_record",
+            "database_atomic_exchange_fail_after_first_move",
+            "database_atomic_exchange_fail_to_finish",
+        ]
+    ):
+        node.query("SYSTEM REFRESH VIEW fence_atomic.mv")
+        assert_eq_with_retry(
+            node,
+            "SELECT exception != '' FROM system.view_refreshes"
+            " WHERE database = 'fence_atomic' AND view = 'mv'",
+            "1",
+            retry_count=60,
+        )
+    assert "UNFINISHED" in node.query_and_get_error("DROP TABLE fence_atomic.mv")
+    assert node.query("SELECT count() FROM fence_atomic.mv").strip() == "0"
+
     node.restart_clickhouse()
 
-    # The load finishes the exchange from its record, and the fence is gone.
+    # The load finishes the exchange from its record, and the fence is gone. The table with the Keeper path
+    # of `a` is now `b`.
     assert has_column("fence_atomic", "a", "y") == "1"
     assert has_column("fence_atomic", "b", "y") == "0"
-    assert has_column("fence_atomic", "r", "z") == "0"
+    assert has_column("fence_atomic", "b", "z") == "0"
+    assert node.query("SELECT count() FROM fence_atomic.b").strip() == "2"
     # The replica applies the entry after the restart and is not read-only.
     assert_eq_with_retry(
         node,
         "SELECT count() FROM system.columns"
-        " WHERE database = 'fence_atomic' AND table = 'r' AND name = 'w'",
+        " WHERE database = 'fence_atomic' AND table = 'b' AND name = 'w'",
         "1",
         retry_count=60,
     )
     assert (
         node.query(
             "SELECT is_readonly FROM system.replicas"
-            " WHERE database = 'fence_atomic' AND table = 'r'"
+            " WHERE database = 'fence_atomic' AND table = 'b'"
         ).strip()
         == "0"
     )
-    node.query("UNDROP TABLE fence_atomic.u")
-    assert node.query("SELECT count() FROM fence_atomic.u").strip() == "1"
     files = metadata_files("fence_atomic")
     assert not any(name.startswith(".") for name in files)
     assert not any(name.endswith(".tmp_exchange") for name in files)
-    node.query("RENAME TABLE fence_ordinary.t TO fence_atomic.t")
-    assert node.query("SELECT count() FROM fence_atomic.t").strip() == "1"
-    node.query(create_c)
-    node.query("DROP TABLE fence_ordinary.r_alias SYNC")
+    node.query("ALTER TABLE fence_atomic.a ADD COLUMN z UInt8")
+    # The load finished the exchange of the refresh, so the view shows the fresh table, and the drop of the view
+    # also drops the temporary table that the fenced refresh could not drop.
+    assert node.query("SELECT count() FROM fence_atomic.mv").strip() == "1"
+    node.query("DROP TABLE fence_atomic.mv SYNC")
+    assert (
+        node.query(
+            "SELECT count() FROM system.tables"
+            " WHERE database = 'fence_atomic' AND name LIKE '%inner%'"
+        ).strip()
+        == "0"
+    )
+    node.query("DROP TABLE fence_ordinary.a_alias SYNC")
     node.query("DROP DATABASE fence_atomic SYNC")
     node.query("DROP DATABASE fence_ordinary SYNC")
 
@@ -335,18 +393,16 @@ def test_fence_refuses_replica_recovery(started_cluster):
     dict_get = "SELECT dictGet('fence_dict.d1', 'v', toUInt64(1))"
     assert node.query(dict_get).strip() == "one"
 
-    failpoints = [
-        "database_atomic_exchange_with_record",
-        "database_atomic_exchange_always_fail_before_first_move",
-    ]
-    for failpoint in failpoints:
-        node.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
-    error = node.query_and_get_error(
-        "EXCHANGE DICTIONARIES fence_dict.d1 AND fence_dict.d2",
-        settings={"distributed_ddl_output_mode": "none"},
-    )
-    for failpoint in failpoints:
-        node.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+    with failpoints_enabled(
+        [
+            "database_atomic_exchange_with_record",
+            "database_atomic_exchange_always_fail_before_first_move",
+        ]
+    ):
+        error = node.query_and_get_error(
+            "EXCHANGE DICTIONARIES fence_dict.d1 AND fence_dict.d2",
+            settings={"distributed_ddl_output_mode": "none"},
+        )
     assert "FAULT_INJECTED" in error
 
     # A second replica, created after the exchange so that it copies the tables from Keeper, writes an

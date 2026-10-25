@@ -1630,7 +1630,7 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
 
     /// Before anything changes: recovery creates the broken-tables databases and shuts down tables before the fence refuses
     /// to drop or move them. The restart clears the fence, and the recovery after it repairs the files.
-    checkTablesCanBeDroppedOrDetached();
+    checkNoUnfinishedExchange(/* table_name */ "");
 
     is_recovering = true;
     SCOPE_EXIT({ is_recovering = false; });

@@ -6900,9 +6900,6 @@ bool StorageReplicatedMergeTree::executeMetadataAlter(const StorageReplicatedMer
         auto alter_context = getContext();
 
         auto database = DatabaseCatalog::instance().getDatabase(table_id.database_name);
-        /// Before the metadata nodes of this replica change in Keeper ahead of the metadata file. Otherwise the restart that
-        /// clears the fence finds the old file behind the new nodes, and the table stays read-only. The entry is retried.
-        database->checkTablesCanBeAltered();
         bool is_in_replicated_database = database->getEngineName() == "Replicated";
 
         if (is_in_replicated_database)
@@ -7100,10 +7097,6 @@ void StorageReplicatedMergeTree::alter(
 
     auto table_id = getStorageID();
     const auto & query_settings = query_context->getSettingsRef();
-
-    /// `InterpreterAlterQuery` checks the database of the altered table, but an alter of a view or an alias can reach
-    /// a table in another database. Before the change is committed to Keeper, ahead of the metadata file.
-    DatabaseCatalog::instance().getDatabase(table_id.database_name)->checkTablesCanBeAltered();
 
     auto metadata_snapshot = getInMemoryMetadataPtr(query_context, false);
     StorageInMemoryMetadata future_metadata = *metadata_snapshot;

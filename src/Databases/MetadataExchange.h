@@ -43,6 +43,10 @@ String metadataExchangeTmpPath(const String & old_path);
 /// The prefix of the scratch files that check whether a directory supports an atomic exchange.
 inline constexpr auto metadata_exchange_probe_prefix = ".exchange_probe_";
 
+/// Whether a file in a metadata directory is one that `finishInterruptedMetadataExchanges` acts on: a record, a leftover
+/// temporary record, a leftover write of a finish, a probe file, or the temporary file of an exchange.
+bool isMetadataExchangeFileName(const String & file_name);
+
 /// The header line `exchange v1`, then the two paths and the two contents, each escaped and on its own line.
 String serializeMetadataExchangeRecord(const MetadataExchangeRecord & record);
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tags: no-parallel
-# Tag no-parallel: the failpoints are server-wide and would change the exchanges and readers of other tests.
+# Tag no-parallel: the failpoints of the exchange are server-wide and would change the exchanges of other tests.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -32,8 +32,10 @@ $CLICKHOUSE_CLIENT -q "
     CREATE TABLE $DB.b (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x;
 "
 
-# The metadata of the databases is not on the local filesystem (for example, a `database_disk` on object storage),
-# where exchanges never use a record. The directory of a database exists once it has a table.
+# Exchanges never use a record when the server setting turns the emulation off, or when the metadata of the databases
+# is not on the local filesystem (for example, a `database_disk` on object storage). The exchange would then never
+# pause, and `SYSTEM WAIT FAILPOINT` below would wait forever. The directory of a database exists once it has a table.
+EMULATION=$($CLICKHOUSE_CLIENT -q "SELECT value FROM system.server_settings WHERE name = 'database_atomic_allow_exchange_emulation'")
 DISK_PATH=$($CLICKHOUSE_CLIENT -q "SELECT path FROM system.disks WHERE name = 'default'")
 REL=$($CLICKHOUSE_CLIENT -q "SELECT metadata_path FROM system.databases WHERE name = '$DB'")
 if [ -z "$DISK_PATH" ] || [ -z "$REL" ] || [[ "${DISK_PATH%/}/$REL" != */store/* ]]
@@ -41,16 +43,18 @@ then
     echo "Cannot find the metadata directory of $DB: disk path '$DISK_PATH', metadata path '$REL'" >&2
     exit 1
 fi
-if [ ! -d "${DISK_PATH%/}/$REL" ]
+if [ "$EMULATION" != "1" ] || [ ! -d "${DISK_PATH%/}/$REL" ]
 then
     cat "${BASH_SOURCE[0]%.sh}.reference"
     exit 0
 fi
 
-# The reader finds the table and stops before it reads the metadata file.
+# The reader finds the table and stops before it reads the metadata file. Only a query whose id starts with
+# `atomic_pause_before_reading_create_query_` stops there, so that no other reader of metadata takes the pause.
 $CLICKHOUSE_CLIENT -q "SYSTEM ENABLE FAILPOINT $READER_FAILPOINT"
 (
-    output=$($CLICKHOUSE_CLIENT -q "SHOW CREATE TABLE $DB.a FORMAT TSVRaw" 2>&1)
+    output=$($CLICKHOUSE_CLIENT --query_id "atomic_pause_before_reading_create_query_${CLICKHOUSE_DATABASE}_$RANDOM$RANDOM" \
+        -q "SHOW CREATE TABLE $DB.a FORMAT TSVRaw" 2>&1)
     if [[ "$output" == *'`y` UInt8'* ]]
     then
         echo "the reader sees the exchanged table"

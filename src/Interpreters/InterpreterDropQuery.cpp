@@ -312,9 +312,6 @@ BlockIO InterpreterDropQuery::executeToTableImpl(const ContextPtr & context_, AS
                 DatabaseCatalog::instance().checkTableCanBeRemovedOrRenamed(table_id, check_ref_deps, check_loading_deps, is_drop_or_detach_database);
             }
 
-            /// Before the table is shut down, so that a refusal leaves it working.
-            database->checkTablesCanBeDroppedOrDetached();
-
             context_->onQueryExecutionStarted();
             table->flushAndShutdown();
             TableExclusiveLockHolder table_lock;
@@ -395,8 +392,12 @@ BlockIO InterpreterDropQuery::executeToTableImpl(const ContextPtr & context_, AS
             bool check_loading_deps = !check_ref_deps && getContext()->getSettingsRef()[Setting::check_table_dependencies];
             DatabaseCatalog::instance().checkTableCanBeRemovedOrRenamed(table_id, check_ref_deps, check_loading_deps, is_drop_or_detach_database);
 
-            /// Before the table is shut down, so that a refusal leaves it working.
-            database->checkTablesCanBeDroppedOrDetached();
+            /// `dropInnerTableIfAny` drops the inner tables after this table is shut down, and the guard of this table
+            /// checks only its own name, so the names of the inner tables are checked here. A refresh of the view that
+            /// is running now can still fail its exchange of the inner table after this check, before the shutdown stops it.
+            for (const auto & inner_table_id : table->getInnerTablesToDrop(context_))
+                if (auto inner_database = DatabaseCatalog::instance().tryGetDatabase(inner_table_id.getDatabaseName()))
+                    inner_database->checkNoUnfinishedExchange(inner_table_id.getTableName());
 
             context_->onQueryExecutionStarted();
             table->flushAndShutdown(true);
@@ -547,10 +548,10 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query, 
             tryLogCurrentException("InterpreterDropQuery", "Async loading failed", LogsLevel::warning);
     }
 
-    /// Before anything below changes the database or its tables.
-    /// `TRUNCATE ALL TABLES` only truncates data, so it does not need the check.
+    /// Before anything below changes the database or its tables. The guards of the tables, taken below, check each table
+    /// only after the tables are prepared for shutdown. `TRUNCATE ALL TABLES` only truncates data, so it does not need the check.
     if (!truncate || !query.has_tables)
-        database->checkCanBeDroppedOrDetached();
+        database->checkNoUnfinishedExchange(/* table_name */ "");
 
     getContext()->onQueryExecutionStarted();
     if (!truncate && database->hasReplicationThread())

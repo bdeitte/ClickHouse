@@ -1263,6 +1263,7 @@ DDLGuardPtr DatabaseCatalog::getDDLGuard(const String & database, const String &
     if (expected_database && expected_database != tryGetDatabase(database).get())
         throw Exception(ErrorCodes::UNFINISHED, "The database {} was dropped or renamed concurrently", database);
 
+    checkNoUnfinishedExchange(database, table);
     return guard;
 }
 
@@ -1286,7 +1287,19 @@ DDLGuardPtr DatabaseCatalog::tryGetDDLGuard(
     if (expected_database && expected_database != tryGetDatabase(database).get())
         throw Exception(ErrorCodes::UNFINISHED, "The database {} was dropped or renamed concurrently", database);
 
+    checkNoUnfinishedExchange(database, table);
     return guard;
+}
+
+void DatabaseCatalog::checkNoUnfinishedExchange(const String & database, const String & table) const
+{
+    /// Called with the guard of `table` held. An exchange of metadata files leaves a fence on a name only while it holds
+    /// the guard of that name, so the answer cannot change until the guard is released, and a query that holds the guard
+    /// is refused before it changes anything. A guard of the whole database (an empty name) does not check.
+    if (table.empty())
+        return;
+    if (auto db = tryGetDatabase(database))
+        db->checkNoUnfinishedExchange(table);
 }
 
 DDLGuardPtr DatabaseCatalog::tryGetDDLGuardForStorage(
@@ -1616,8 +1629,6 @@ void DatabaseCatalog::undropTable(StorageID table_id, std::function<void()> thro
     /// its table list is incomplete and the check would undercount. Do it before taking
     /// `tables_marked_dropped_mutex`, because startup can drop tables.
     database->waitDatabaseStarted();
-    /// Before the metadata file moves and the table leaves the dropped-table queue, so that a refusal changes nothing.
-    database->checkTablesCanBeCreated();
 
     String latest_metadata_dropped_path;
     TableMarkedAsDropped dropped_table;

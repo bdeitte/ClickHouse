@@ -565,6 +565,9 @@ public:
 
     virtual void dropInnerTableIfAny(bool /* sync */, ContextPtr /* context */) {}
 
+    /// The tables that `dropInnerTableIfAny` drops if they exist, so that `DROP TABLE` can check them before it shuts this table down.
+    virtual std::vector<StorageID> getInnerTablesToDrop(ContextPtr /* context */) const { return {}; }
+
     /// Return true if the storage supports TRUNCATE operation.
     /// Storages without their own data (e.g. View) return false.
     virtual bool supportsTruncate() const { return true; }

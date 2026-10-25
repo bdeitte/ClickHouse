@@ -652,16 +652,20 @@ void StorageMaterializedView::drop()
     dropInnerTableIfAny(/* sync */ false, getContext());
 }
 
-void StorageMaterializedView::dropInnerTableIfAny(bool sync, ContextPtr local_context)
+std::vector<StorageID> StorageMaterializedView::getInnerTablesToDrop(ContextPtr) const
 {
     if (!has_inner_table)
-        return;
+        return {};
 
     std::vector<StorageID> to_drop = {getTargetTableId()};
     if (!fixed_uuid)
         to_drop.push_back(StorageID(to_drop[0].getDatabaseName(), ".tmp" + to_drop[0].getTableName()));
+    return to_drop;
+}
 
-    for (const StorageID & inner_table_id : to_drop)
+void StorageMaterializedView::dropInnerTableIfAny(bool sync, ContextPtr local_context)
+{
+    for (const StorageID & inner_table_id : getInnerTablesToDrop(local_context))
     {
         /// We will use `sync` argument when this function is called from a DROP query
         /// and will ignore database_atomic_wait_for_drop_and_detach_synchronously when it's called from drop task.

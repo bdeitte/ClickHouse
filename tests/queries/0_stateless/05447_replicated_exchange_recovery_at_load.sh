@@ -78,9 +78,11 @@ $CLIENT -q "CREATE DATABASE $DB ENGINE = Replicated('$ZK_PATH', 'shard1', 'repli
 $CLIENT -q "CREATE TABLE $DB.a (x UInt8) ENGINE = MergeTree ORDER BY x"
 set_metadata_dir "$DB" REL DIR_CHECKED
 
-# The metadata of the database is not on the local filesystem (for example, a `database_disk` on object storage),
-# where loading does not finish exchanges. The directory of a database exists once it has a table.
-if [ ! -d "$DIR_CHECKED" ]
+# The exchange below never uses a record when the server setting turns the emulation off, and loading does not finish
+# exchanges when the metadata of the database is not on the local filesystem (for example, a `database_disk` on object
+# storage). The directory of a database exists once it has a table.
+EMULATION=$($CLICKHOUSE_CLIENT -q "SELECT value FROM system.server_settings WHERE name = 'database_atomic_allow_exchange_emulation'")
+if [ "$EMULATION" != "1" ] || [ ! -d "$DIR_CHECKED" ]
 then
     cat "${BASH_SOURCE[0]%.sh}.reference"
     exit 0

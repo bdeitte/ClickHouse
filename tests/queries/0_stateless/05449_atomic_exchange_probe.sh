@@ -47,24 +47,33 @@ function now_us()
     $CLICKHOUSE_CLIENT -q "SELECT toUnixTimestamp64Micro(now64(6))"
 }
 
-for failpoint in $FAILPOINTS
-do
-    echo "$failpoint"
+function create_tables()
+{
     $CLICKHOUSE_CLIENT -q "
         DROP DATABASE IF EXISTS $DB SYNC;
         CREATE DATABASE $DB ENGINE = Atomic;
         CREATE TABLE $DB.a (x UInt8) ENGINE = MergeTree ORDER BY x;
         CREATE TABLE $DB.b (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x;
     "
-    set_metadata_dir DIR
+}
 
-    # The metadata of the databases is not on the local filesystem (for example, a `database_disk` on object storage),
-    # where exchanges never probe. The directory of a database exists once it has a table.
-    if [ ! -d "$DIR" ]
-    then
-        cat "${BASH_SOURCE[0]%.sh}.reference"
-        exit 0
-    fi
+# Exchanges never probe when the server setting turns the emulation off, or when the metadata of the databases is not
+# on the local filesystem (for example, a `database_disk` on object storage). The directory of a database exists once
+# it has a table. Both checks run before the loop prints anything, so that the skip prints the reference alone.
+EMULATION=$($CLICKHOUSE_CLIENT -q "SELECT value FROM system.server_settings WHERE name = 'database_atomic_allow_exchange_emulation'")
+create_tables
+set_metadata_dir DIR
+if [ "$EMULATION" != "1" ] || [ ! -d "$DIR" ]
+then
+    cat "${BASH_SOURCE[0]%.sh}.reference"
+    exit 0
+fi
+
+for failpoint in $FAILPOINTS
+do
+    echo "$failpoint"
+    create_tables
+    set_metadata_dir DIR
 
     since=$(now_us)
     $CLICKHOUSE_CLIENT -q "SYSTEM ENABLE FAILPOINT $failpoint"

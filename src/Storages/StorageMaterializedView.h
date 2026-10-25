@@ -59,6 +59,7 @@ public:
 
     void drop() override;
     void dropInnerTableIfAny(bool sync, ContextPtr local_context) override;
+    std::vector<StorageID> getInnerTablesToDrop(ContextPtr local_context) const override;
 
     /// Forward the size guard onto the inner target table that `dropInnerTableIfAny`
     /// will actually drop, so `CREATE OR REPLACE MATERIALIZED VIEW` cannot delete an

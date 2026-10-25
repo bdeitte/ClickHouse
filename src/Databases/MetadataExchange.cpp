@@ -60,6 +60,15 @@ std::mutex & metadataExchangeMutex()
     return mutex;
 }
 
+bool isMetadataExchangeFileName(const String & file_name)
+{
+    const String record_suffix = String(".sql") + exchange_record_suffix;
+    if (!file_name.starts_with('.'))
+        return file_name.ends_with(String(".sql") + metadata_exchange_tmp_suffix);
+    return file_name.ends_with(record_suffix) || file_name.ends_with(record_suffix + ".tmp")
+        || file_name.ends_with(String(".sql") + exchange_write_suffix) || file_name.starts_with(metadata_exchange_probe_prefix);
+}
+
 String metadataExchangeRecordPath(const String & metadata_file_path)
 {
     fs::path path(metadata_file_path);
@@ -260,11 +269,11 @@ void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & met
             LOG_WARNING(log, "Finished the interrupted exchange of {} and {}", record->old_path, record->new_path);
         }
 
-        Strings finished_record_paths{primary_path};
-        const String copy_path = metadataExchangeRecordPath(record->new_path);
-        if (copy_path != primary_path && readMetadataFileIfExists(disk, copy_path) == content)
-            finished_record_paths.push_back(copy_path);
-        tryRemoveMetadataExchangeRecords(disk, finished_record_paths, log, /* found_at_load */ true);
+        /// Only the record in this directory: the record in the directory of the other database is left for its own load.
+        /// That load lists its metadata files in the same pass that looks for records, so it may pass a file before this load
+        /// puts it in place. Its record makes it list the files again, after this load releases the mutex. It then finds no
+        /// temporary file, or a copy whose primary is gone, and only removes the record.
+        tryRemoveMetadataExchangeRecords(disk, {record_path}, log, /* found_at_load */ true);
     }
 }
 

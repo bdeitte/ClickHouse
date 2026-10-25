@@ -122,6 +122,10 @@ protected:
 
     void iterateMetadataFiles(const IteratingFunction & process_metadata_file) const;
 
+    /// Called by `iterateMetadataFiles` when the metadata directory has files of exchanges of metadata files with a record,
+    /// before any metadata file is processed. Returns whether it finished the exchanges, so that the files are listed again.
+    virtual bool finishInterruptedMetadataExchangesAtLoad() const { return false; }
+
     ASTPtr getCreateDatabaseQueryImpl() const override TSA_REQUIRES(mutex);
     ASTPtr getCreateTableQueryImpl(
         const String & table_name,

@@ -16,6 +16,14 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 DB="${CLICKHOUSE_DATABASE}_readers"
 
+# Exchanges never use a record when the server setting turns the emulation off.
+EMULATION=$($CLICKHOUSE_CLIENT -q "SELECT value FROM system.server_settings WHERE name = 'database_atomic_allow_exchange_emulation'")
+if [ "$EMULATION" != "1" ]
+then
+    cat "${BASH_SOURCE[0]%.sh}.reference"
+    exit 0
+fi
+
 function cleanup()
 {
     $CLICKHOUSE_CLIENT -q "SYSTEM DISABLE FAILPOINT database_atomic_exchange_with_record"

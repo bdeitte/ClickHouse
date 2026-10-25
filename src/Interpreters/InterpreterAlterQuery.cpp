@@ -594,7 +594,6 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
 
     DatabasePtr database = DatabaseCatalog::instance().getDatabase(table_id.database_name);
     bool is_mutation = false;
-    bool changes_metadata = false;
     for (const auto & child : alter.command_list->children)
     {
         const auto & command = child->as<const ASTAlterCommand &>();
@@ -603,15 +602,7 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
             is_mutation = true;
             checkNoRowPolicyForSetOperands(child, table_id.database_name, getContext());
         }
-        /// The same classification as `parseAlterCommandSegments`: these commands go to `IStorage::alter`.
-        else if (command.type != ASTAlterCommand::EXECUTE_COMMAND && AlterCommand::parse(&command))
-            changes_metadata = true;
     }
-
-    /// Before the query is replicated, and before `ReplicatedMergeTree` commits the change to Keeper ahead of the metadata file,
-    /// so that a refusal changes nothing. Mutations and partition commands do not change the metadata file, so they are not checked.
-    if (changes_metadata)
-        database->checkTablesCanBeAltered();
 
     if (database->shouldReplicateQuery(getContext(), query_ptr))
     {

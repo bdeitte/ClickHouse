@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <string_view>
 #include <thread>
 #include <Core/ServerSettings.h>
 #include <Core/Settings.h>
@@ -82,6 +83,15 @@ namespace ErrorCodes
 namespace DatabaseMetadataDiskSetting
 {
 extern const DatabaseMetadataDiskSettingsString disk;
+}
+
+namespace
+{
+
+/// Only a query whose id starts with the prefix pauses at `database_atomic_pause_before_reading_create_query`,
+/// so that the readers of other queries and of background threads do not take the pause meant for a test.
+constexpr std::string_view pause_before_reading_create_query_query_id_prefix = "atomic_pause_before_reading_create_query_";
+
 }
 
 class AtomicDatabaseTablesSnapshotIterator final : public DatabaseTablesSnapshotIterator
@@ -205,7 +215,7 @@ StoragePtr DatabaseAtomic::detachTable(ContextPtr /* context */, const String & 
     StoragePtr detached_table;
     {
         std::lock_guard lock(mutex);
-        assertNoUnfinishedExchangeUnlocked();
+        assertTableHasNoUnfinishedExchangeUnlocked(name);
         detached_table = DatabaseOrdinary::detachTableUnlocked(name);
         table_name_to_path.erase(name);
         detached_tables.emplace(detached_table->getStorageID().uuid, detached_table);
@@ -244,7 +254,7 @@ void DatabaseAtomic::dropTableImpl(ContextPtr local_context, const String & tabl
     auto db_disk = getDisk();
     {
         std::lock_guard lock(mutex);
-        assertNoUnfinishedExchangeUnlocked();
+        assertTableHasNoUnfinishedExchangeUnlocked(table_name);
         table = getTableUnlocked(table_name);
         table_metadata_path_drop = DatabaseCatalog::instance().getPathForDroppedMetadata(table->getStorageID());
 
@@ -405,9 +415,8 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
         db_lock = std::unique_lock{mutex};
     }
 
-    assertNoUnfinishedExchangeUnlocked();
-    if (!inside_database)
-        other_db.assertNoUnfinishedExchangeUnlocked();
+    assertTableHasNoUnfinishedExchangeUnlocked(table_name);
+    other_db.assertTableHasNoUnfinishedExchangeUnlocked(to_table_name);
 
     if (!exchange)
         other_db.checkMetadataFilenameAvailabilityUnlocked(to_table_name);
@@ -481,7 +490,7 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
     /// NOTE: replica will be lost if server crashes before the following rename
     /// TODO better detection and recovery
     if (use_record)
-        exchangeMetadataFilesWithRecord(other_db, db_disk, record, record_paths, fsync, has_keeper_transaction);
+        exchangeMetadataFilesWithRecord(other_db, table_name, to_table_name, db_disk, record, record_paths, fsync, has_keeper_transaction);
     else if (exchange)
         db_disk->renameExchange(old_metadata_path, new_metadata_path);
     else
@@ -523,7 +532,7 @@ void DatabaseAtomic::commitCreateTable(const ASTCreateQuery & query, const Stora
         if (query.getDatabase() != database_name)
             throw Exception(ErrorCodes::UNKNOWN_DATABASE, "Database was renamed to `{}`, cannot create table in `{}`",
                             database_name, query.getDatabase());
-        assertNoUnfinishedExchangeUnlocked();
+        assertTableHasNoUnfinishedExchangeUnlocked(query.getTable());
         /// Do some checks before renaming file from .tmp to .sql
         not_in_use = cleanupDetachedTables();
         assertDetachedTableNotInUse(query.uuid);
@@ -562,7 +571,7 @@ void DatabaseAtomic::commitAlterTable(const StorageID & table_id, const String &
     });
 
     std::lock_guard lock{mutex};
-    assertNoUnfinishedExchangeUnlocked();
+    assertTableHasNoUnfinishedExchangeUnlocked(table_id.table_name);
     auto actual_table_id = getTableUnlocked(table_id.table_name)->getStorageID();
 
     if (table_id.uuid != actual_table_id.uuid)
@@ -580,34 +589,34 @@ void DatabaseAtomic::commitAlterTable(const StorageID & table_id, const String &
         db_disk->replaceFile(table_metadata_tmp_path, table_metadata_path);
 }
 
-void DatabaseAtomic::checkCanBeDroppedOrDetached() const
+void DatabaseAtomic::checkNoUnfinishedExchange(const String & table_name) const
 {
     std::lock_guard lock{mutex};
-    assertNoUnfinishedExchangeUnlocked();
-}
-
-void DatabaseAtomic::checkTablesCanBeDroppedOrDetached() const
-{
-    std::lock_guard lock{mutex};
-    assertNoUnfinishedExchangeUnlocked();
-}
-
-void DatabaseAtomic::checkTablesCanBeCreated() const
-{
-    std::lock_guard lock{mutex};
-    assertNoUnfinishedExchangeUnlocked();
-}
-
-void DatabaseAtomic::checkTablesCanBeAltered() const
-{
-    std::lock_guard lock{mutex};
-    assertNoUnfinishedExchangeUnlocked();
+    if (unfinished_exchange_in_database)
+        throw Exception(ErrorCodes::UNFINISHED,
+                        "An exchange of {} in database {} failed and could not be finished, so DDL on the database fails "
+                        "until the server restarts. {}",
+                        unfinished_exchange_in_database->files, backQuote(database_name), unfinished_exchange_in_database->hint);
+    if (table_name.empty() && !unfinished_exchanges.empty())
+    {
+        const auto & [_, exchange] = *unfinished_exchanges.begin();
+        throw Exception(ErrorCodes::UNFINISHED,
+                        "An exchange of {} in database {} failed and could not be finished, so the database cannot be dropped "
+                        "or detached until the server restarts. {}",
+                        exchange.files, backQuote(database_name), exchange.hint);
+    }
+    if (!table_name.empty())
+        assertTableHasNoUnfinishedExchangeUnlocked(table_name);
 }
 
 ASTPtr DatabaseAtomic::readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const
 {
     /// Lets a test hold a reader that has passed `mutex` until an exchange is between its moves.
-    FailPointInjection::pauseFailPoint(FailPoints::database_atomic_pause_before_reading_create_query);
+    /// This runs for every table in `system.tables`. The first check is `false` in builds without failpoints,
+    /// so they do not build the name of the failpoint as a `String` and look it up.
+    if (FailPointInjection::hasAnyFailPointBeenRegistered()
+        && CurrentThread::getQueryId().starts_with(pause_before_reading_create_query_query_id_prefix))
+        FailPointInjection::pauseFailPoint(FailPoints::database_atomic_pause_before_reading_create_query);
     std::shared_lock lock(metadata_files_mutex);
     return DatabaseOrdinary::readCreateQueryFromMetadataFile(table_name, throw_on_error);
 }
@@ -624,13 +633,12 @@ time_t DatabaseAtomic::getObjectMetadataModificationTime(const String & object_n
     return DatabaseOrdinary::getObjectMetadataModificationTime(object_name);
 }
 
-void DatabaseAtomic::assertNoUnfinishedExchangeUnlocked() const
+void DatabaseAtomic::assertTableHasNoUnfinishedExchangeUnlocked(const String & table_name) const
 {
-    if (!unfinished_exchange.empty())
+    if (auto it = unfinished_exchanges.find(table_name); it != unfinished_exchanges.end())
         throw Exception(ErrorCodes::UNFINISHED,
-                        "An exchange of {} in database {} failed and could not be finished, so DDL on the database fails "
-                        "until the server restarts. {}",
-                        unfinished_exchange, backQuote(database_name), unfinished_exchange_hint);
+                        "An exchange of {} failed and could not be finished, so DDL on table {}.{} fails until the server restarts. {}",
+                        it->second.files, backQuote(database_name), backQuote(table_name), it->second.hint);
 }
 
 void DatabaseAtomic::assertDetachedTableNotInUse(const UUID & uuid)
@@ -735,15 +743,14 @@ void DatabaseAtomic::beforeLoadingMetadata(ContextMutablePtr /*context*/, Loadin
     }
 }
 
-void DatabaseAtomic::loadTablesMetadata(ContextPtr local_context, ParsedTablesMetadata & metadata, bool is_startup)
+bool DatabaseAtomic::finishInterruptedMetadataExchangesAtLoad() const
 {
     auto db_disk = getDisk();
-    if (canEmulateExchange(db_disk) && !db_disk->isReadOnly() && db_disk->existsDirectory(getMetadataPath()))
-    {
-        const bool fsync = getContext()->getGlobalContext()->getSettingsRef()[Setting::fsync_metadata];
-        finishInterruptedMetadataExchanges(db_disk, getMetadataPath(), fsync, log);
-    }
-    DatabaseOrdinary::loadTablesMetadata(local_context, metadata, is_startup);
+    if (!canEmulateExchange(db_disk) || db_disk->isReadOnly())
+        return false;
+    const bool fsync = getContext()->getGlobalContext()->getSettingsRef()[Setting::fsync_metadata];
+    finishInterruptedMetadataExchanges(db_disk, getMetadataPath(), fsync, log);
+    return true;
 }
 
 bool DatabaseAtomic::canEmulateExchange(const DiskPtr & disk)
@@ -804,6 +811,8 @@ bool DatabaseAtomic::canExchangeAtomically()
 
 void DatabaseAtomic::exchangeMetadataFilesWithRecord(
     DatabaseAtomic & other_db,
+    const String & table_name,
+    const String & other_table_name,
     const DiskPtr & disk,
     const MetadataExchangeRecord & record,
     const Strings & record_paths,
@@ -918,7 +927,7 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
 
     if (outcome == Outcome::Fence)
     {
-        /// The records stay for the next load, and until then DDL on both databases fails. The next load finishes an `Interrupted`
+        /// The records stay for the next load, and until then DDL on the two tables fails, and in `Replicated` on both databases. The next load finishes an `Interrupted`
         /// exchange. Without the temporary file it only removes the records: in `Replicated`, the replica recovery from Keeper then
         /// repairs files that are behind Keeper. With the temporary file in any other state, the load reports `CORRUPTED_DATA` and
         /// the files need manual repair. The hint tells the user which of these the restart does.
@@ -964,22 +973,30 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
                     "so compare them with the contents in the record before the restart",
                     record_path);
         }
+        /// The databases of an exchange have the same engine. In `Replicated`, the digest reads every metadata file,
+        /// so the fence covers every table of the database, see `unfinished_exchange_in_database`.
+        const bool fence_database = dynamic_cast<const DatabaseReplicated *>(this) != nullptr;
         /// The fence also refuses the cleanup `DROP` of the temporary table, and the `ALTER` entries that the tables replicate.
         hint += ". If the exchange was done by `CREATE OR REPLACE`, `REPLACE TABLE` or a refresh of a materialized view, "
-            "its temporary table could not be dropped: after the restart, drop it if it is still there. "
-            "Until the restart, `ReplicatedMergeTree` tables in the database cannot apply `ALTER` entries from other replicas, "
-            "and the entries queued after them wait";
-        /// The fence refuses the entries of the database log and the recovery of the replica.
-        if (has_keeper_transaction)
-            hint += ". Until the restart, this replica of the `Replicated` database also stops applying the database log "
-                "once another replica writes to it, so queries on this replica that go through the log fail";
+            "its temporary table could not be dropped: after the restart, drop it if it is still there. ";
+        if (fence_database)
+            hint += "Until the restart, `ReplicatedMergeTree` tables in the database cannot apply `ALTER` entries from other replicas, "
+                "and the entries queued after them wait. This replica of the `Replicated` database also stops applying "
+                "the database log once another replica writes to it, so queries on this replica that go through the log fail";
+        else
+            hint += "Until the restart, a `ReplicatedMergeTree` table among the two cannot apply `ALTER` entries from other replicas, "
+                "and the entries queued after them wait";
 
-        unfinished_exchange = fmt::format("{} and {}", record.old_path, record.new_path);
-        unfinished_exchange_hint = hint;
-        other_db.unfinished_exchange = unfinished_exchange;
-        other_db.unfinished_exchange_hint = hint;
-        LOG_ERROR(log, "Cannot finish the exchange of {}, DDL on the databases of both files fails until the server restarts. {}",
-            unfinished_exchange, hint);
+        const UnfinishedExchange unfinished{fmt::format("{} and {}", record.old_path, record.new_path), hint};
+        unfinished_exchanges[table_name] = unfinished;
+        other_db.unfinished_exchanges[other_table_name] = unfinished;
+        if (fence_database)
+        {
+            unfinished_exchange_in_database = unfinished;
+            other_db.unfinished_exchange_in_database = unfinished;
+        }
+        LOG_ERROR(log, "Cannot finish the exchange of {}, DDL on {} fails until the server restarts. {}",
+            unfinished.files, fence_database ? "the databases of both files" : "the two tables", hint);
 
         try
         {

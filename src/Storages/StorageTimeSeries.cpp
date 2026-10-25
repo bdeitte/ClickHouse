@@ -488,24 +488,32 @@ void StorageTimeSeries::drop()
     dropInnerTableIfAny(/* sync= */ false, getContext());
 }
 
-void StorageTimeSeries::dropInnerTableIfAny(bool sync, ContextPtr local_context)
+std::vector<StorageID> StorageTimeSeries::getInnerTablesToDrop(ContextPtr local_context) const
 {
+    std::vector<StorageID> to_drop;
     if (!hasInnerTables())
-        return;
+        return to_drop;
 
     for (auto target_kind : getTargetKinds())
     {
         if (isInnerTable(target_kind))
         {
             if (auto inner_table_id = tryGetTargetTableID(target_kind, local_context))
-            {
-                /// DDLGuards must be locked in order of increasing table name, so the inner guard
-                /// may be requested only when this table's name sorts first.
-                bool may_lock_ddl_guard = getStorageID().getQualifiedName() < inner_table_id.getQualifiedName();
-                InterpreterDropQuery::executeDropQuery(ASTDropQuery::Kind::Drop, getContext(), local_context, inner_table_id,
-                                                    sync, /* ignore_sync_setting= */ true, may_lock_ddl_guard);
-            }
+                to_drop.push_back(inner_table_id);
         }
+    }
+    return to_drop;
+}
+
+void StorageTimeSeries::dropInnerTableIfAny(bool sync, ContextPtr local_context)
+{
+    for (const StorageID & inner_table_id : getInnerTablesToDrop(local_context))
+    {
+        /// DDLGuards must be locked in order of increasing table name, so the inner guard
+        /// may be requested only when this table's name sorts first.
+        bool may_lock_ddl_guard = getStorageID().getQualifiedName() < inner_table_id.getQualifiedName();
+        InterpreterDropQuery::executeDropQuery(ASTDropQuery::Kind::Drop, getContext(), local_context, inner_table_id,
+                                            sync, /* ignore_sync_setting= */ true, may_lock_ddl_guard);
     }
 }
 
