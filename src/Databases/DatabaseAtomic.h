@@ -99,6 +99,9 @@ public:
     std::vector<std::pair<ASTPtr, StoragePtr>> getTablesForBackup(const FilterByNameFunction & filter, const ContextPtr & local_context) const override;
 
 protected:
+    /// Throws `UNFINISHED` while `unfinished_exchange_in_database` is set.
+    void assertNoUnfinishedExchangeInDatabaseUnlocked() const TSA_REQUIRES(mutex);
+
     /// Finishes the exchanges of metadata files that a crash interrupted, also when the server setting turns the emulation off,
     /// so that the setting can be turned off after a crash. Not on a read-only disk.
     bool finishInterruptedMetadataExchangesAtLoad() const override;
@@ -162,11 +165,10 @@ private:
 
     /// Throws `UNFINISHED` while an exchange of the metadata file of `table_name` could not be finished.
     void assertTableHasNoUnfinishedExchangeUnlocked(const String & table_name) const TSA_REQUIRES(mutex);
-    /// Throws `UNFINISHED` while `unfinished_exchange_in_database` is set.
-    void assertNoUnfinishedExchangeInDatabaseUnlocked() const TSA_REQUIRES(mutex);
-    /// Called under `mutex` by the operations that change metadata files, before they commit, after `checkNoUnfinishedExchange`
-    /// passed when the DDL guard was taken. In `Atomic`, an operation on another table that started before an exchange failed
-    /// finishes, as it would have if it had been a moment faster. In `Replicated`, it is refused, see `unfinished_exchange_in_database`.
+    /// Called under `mutex` by the operations that change metadata files and the digest of `Replicated`, before they commit,
+    /// after `checkNoUnfinishedExchange` passed when the DDL guard was taken. In `Atomic`, an operation on another table that
+    /// started before an exchange failed finishes, as it would have if it had been a moment faster. In `Replicated`, it is refused,
+    /// see `unfinished_exchange_in_database`.
     void assertCanCommitMetadataChangeUnlocked(const String & table_name) const TSA_REQUIRES(mutex);
 
     struct UnfinishedExchange

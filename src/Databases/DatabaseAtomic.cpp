@@ -215,7 +215,9 @@ StoragePtr DatabaseAtomic::detachTable(ContextPtr /* context */, const String & 
     StoragePtr detached_table;
     {
         std::lock_guard lock(mutex);
-        assertCanCommitMetadataChangeUnlocked(name);
+        /// Not the fence of the whole database in `Replicated`: a detach that is not permanent does not change the digest, and
+        /// `SYSTEM RESTART REPLICA` detaches after it shut the table down. `DatabaseReplicated::detachTablePermanently` checks it.
+        assertTableHasNoUnfinishedExchangeUnlocked(name);
         detached_table = DatabaseOrdinary::detachTableUnlocked(name);
         table_name_to_path.erase(name);
         detached_tables.emplace(detached_table->getStorageID().uuid, detached_table);

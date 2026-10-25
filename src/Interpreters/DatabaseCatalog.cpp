@@ -1295,7 +1295,9 @@ void DatabaseCatalog::checkNoUnfinishedExchange(const String & database, const S
 {
     /// Called with the guard of `table` held. An exchange of metadata files leaves a fence on a name only while it holds
     /// the guard of that name, so the answer cannot change until the guard is released, and a query that holds the guard
-    /// is refused before it changes anything. A guard of the whole database (an empty name) does not check.
+    /// is refused before it changes anything. The fence of a whole `Replicated` database can appear while the guard of another
+    /// table is held: the commit of a change of metadata refuses it then, see `DatabaseAtomic::assertCanCommitMetadataChangeUnlocked`.
+    /// A guard of the whole database (an empty name) does not check.
     if (table.empty())
         return;
     if (auto db = tryGetDatabase(database))

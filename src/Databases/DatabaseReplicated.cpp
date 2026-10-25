@@ -2831,6 +2831,11 @@ void DatabaseReplicated::detachTablePermanently(ContextPtr local_context, const 
     }
 
     std::lock_guard lock{metadata_mutex};
+    {
+        /// The digest below is computed from `tables_metadata_digest`, which is stale after an unfinished exchange.
+        std::lock_guard db_lock{mutex};
+        assertNoUnfinishedExchangeInDatabaseUnlocked();
+    }
     UInt64 new_digest = tables_metadata_digest;
     new_digest -= getMetadataHash(table_name);
     if (txn && !is_recovering)
