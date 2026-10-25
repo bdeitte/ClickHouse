@@ -11,7 +11,8 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # wait for the moves, so they never see the missing file. The failpoint `database_atomic_exchange_with_record` forces
 # the record, and the test reads the metadata of the two tables while they are exchanged again and again.
 # The test is not expected to detect a missing lock in every run, because a read must fall between two moves for that.
-# Every run checks that the readers and the exchanges do not deadlock.
+# Every run checks that the readers and the exchanges do not deadlock. 05450 checks the lock of `SHOW CREATE TABLE`
+# in every run, with failpoints that hold the reader and the exchange.
 
 DB="${CLICKHOUSE_DATABASE}_readers"
 

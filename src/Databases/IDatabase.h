@@ -559,6 +559,7 @@ public:
     virtual void checkCanBeDroppedOrDetached() const {}
 
     /// Called by `DROP TABLE` and `DETACH TABLE`, before the table is shut down or its dependencies are removed,
+    /// and by the recovery of a `Replicated` replica before it creates the broken-tables databases or shuts down any table,
     /// so that a database which refuses to drop or detach any of its tables fails the query before it changes anything.
     virtual void checkTablesCanBeDroppedOrDetached() const {}
 

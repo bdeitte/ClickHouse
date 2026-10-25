@@ -14,10 +14,14 @@ cluster = ClickHouseCluster(__file__)
 # Keeper path takes `{shard}` and `{replica}` from these macros, not from the `Replicated` database.
 node = cluster.add_instance(
     "node",
+    main_configs=["configs/exchange_emulation.xml"],
     with_zookeeper=True,
     stay_alive=True,
     macros={"shard": "shard1", "replica": "replica1"},
 )
+# Holds a second replica of a `Replicated` database. A second replica on `node` cannot recreate the
+# tables of the database, because their UUIDs are already taken there.
+node2 = cluster.add_instance("node2", with_zookeeper=True)
 
 
 @pytest.fixture(scope="module")
@@ -304,3 +308,78 @@ def test_fence_refuses_move_from_ordinary(started_cluster):
     node.query("DROP TABLE fence_ordinary.r_alias SYNC")
     node.query("DROP DATABASE fence_atomic SYNC")
     node.query("DROP DATABASE fence_ordinary SYNC")
+
+
+def test_fence_refuses_replica_recovery(started_cluster):
+    # The fenced exchange is in Keeper but not in the files, so the digests differ, and every
+    # reinitialization of the DDL worker tries to recover the replica. Recovery would shut down the
+    # exchanged dictionaries, which keep no data on disk, before the fence refuses to drop them.
+    for name, value in [("1", "one"), ("2", "two")]:
+        node.query(
+            f"CREATE TABLE default.fence_dict_src{name} (k UInt64, v String)"
+            " ENGINE = MergeTree ORDER BY k"
+        )
+        node.query(f"INSERT INTO default.fence_dict_src{name} VALUES (1, '{value}')")
+    create_database = (
+        "CREATE DATABASE fence_dict"
+        " ENGINE = Replicated('/clickhouse/databases/fence_dict', 'shard1', '{}')"
+    )
+    node.query(create_database.format("replica1"))
+    for name in ["1", "2"]:
+        node.query(
+            f"CREATE DICTIONARY fence_dict.d{name} (k UInt64, v String) PRIMARY KEY k"
+            f" SOURCE(CLICKHOUSE(DB 'default' TABLE 'fence_dict_src{name}'))"
+            " LAYOUT(FLAT()) LIFETIME(0)",
+            settings={"distributed_ddl_output_mode": "none"},
+        )
+    dict_get = "SELECT dictGet('fence_dict.d1', 'v', toUInt64(1))"
+    assert node.query(dict_get).strip() == "one"
+
+    failpoints = [
+        "database_atomic_exchange_with_record",
+        "database_atomic_exchange_always_fail_before_first_move",
+    ]
+    for failpoint in failpoints:
+        node.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+    error = node.query_and_get_error(
+        "EXCHANGE DICTIONARIES fence_dict.d1 AND fence_dict.d2",
+        settings={"distributed_ddl_output_mode": "none"},
+    )
+    for failpoint in failpoints:
+        node.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+    assert "FAULT_INJECTED" in error
+
+    # A second replica, created after the exchange so that it copies the tables from Keeper, writes an
+    # entry that the fenced replica refuses, which reinitializes its worker. The query does not wait for
+    # the fenced replica, which applies the entry only after the restart.
+    node2.query(create_database.format("replica2"))
+    node2.query(
+        "CREATE TABLE fence_dict.t (x UInt8) ENGINE = MergeTree ORDER BY x",
+        settings={"distributed_ddl_task_timeout": 0},
+    )
+    node.wait_for_log_line(
+        r"Error on initialization of fence_dict: .*An exchange of .* failed and could not be finished",
+        timeout=60,
+    )
+    # The fence refuses the recovery before it changes anything.
+    assert node.query(dict_get).strip() == "one"
+    assert (
+        node.query(
+            "SELECT count() FROM system.databases"
+            " WHERE startsWith(name, 'fence_dict_broken')"
+        ).strip()
+        == "0"
+    )
+
+    node.restart_clickhouse()
+
+    # The recovery after the restart recreates the dictionaries from Keeper, which holds the exchange,
+    # and applies the entry of the second replica.
+    assert_eq_with_retry(node, dict_get, "two", retry_count=60)
+    assert_eq_with_retry(node, "EXISTS TABLE fence_dict.t", "1", retry_count=60)
+    node2.query("DROP DATABASE fence_dict SYNC")
+    node.query("DROP DATABASE fence_dict SYNC")
+    node.query("DROP DATABASE IF EXISTS fence_dict_broken_tables SYNC")
+    node.query("DROP DATABASE IF EXISTS fence_dict_broken_replicated_tables SYNC")
+    for name in ["1", "2"]:
+        node.query(f"DROP TABLE default.fence_dict_src{name} SYNC")

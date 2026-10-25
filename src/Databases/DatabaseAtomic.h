@@ -140,8 +140,9 @@ protected:
     LoadTaskPtr startup_atomic_database_task TSA_GUARDED_BY(mutex);
 
 private:
-    /// Whether the filesystem of the metadata directory exchanges two files atomically.
-    /// The first call checks it with two scratch files, and later calls return the cached answer.
+    /// Whether the filesystem of the metadata directory exchanges two files atomically. The first call exchanges two scratch files
+    /// and checks that their contents were swapped, because some filesystems report success for an exchange that they do
+    /// as a plain rename. Later calls return the cached answer.
     bool canExchangeAtomically();
 
     /// Exchanges the two metadata files of `record` with three moves, instead of an atomic exchange,
@@ -167,7 +168,8 @@ private:
     String unfinished_exchange_hint TSA_GUARDED_BY(mutex);
 
     /// Held exclusively by `exchangeMetadataFilesWithRecord` while it moves the metadata files, and shared by the readers
-    /// of metadata files that do not take `mutex`, such as `SHOW CREATE TABLE`, `system.tables`, `BACKUP` and `ALTER`,
+    /// of metadata files that do not take `mutex`, such as `SHOW CREATE TABLE`, `system.tables`, `BACKUP`, `ALTER`
+    /// and the digest of `DatabaseReplicated`,
     /// so that they never see a file missing between the moves, as with an atomic exchange.
     /// It is taken after `mutex` and `metadataExchangeMutex`, so a reader must not take `mutex` while holding it:
     /// the shared lock covers only the read of the file, not `getDatabaseName`, which takes `mutex`.

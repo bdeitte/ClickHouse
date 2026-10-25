@@ -1628,6 +1628,10 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
     auto component_guard = Coordination::setCurrentComponent("DatabaseReplicated::recoverLostReplica");
     waitDatabaseStarted();
 
+    /// Before anything changes: recovery creates the broken-tables databases and shuts down tables before the fence refuses
+    /// to drop or move them. The restart clears the fence, and the recovery after it repairs the files.
+    checkTablesCanBeDroppedOrDetached();
+
     is_recovering = true;
     SCOPE_EXIT({ is_recovering = false; });
 
@@ -2402,8 +2406,8 @@ ASTPtr DatabaseReplicated::parseQueryFromMetadataOnDisk(const String & table_nam
 {
     auto file_path = getObjectMetadataPath(table_name);
     String description = fmt::format("in metadata {}", file_path);
-    auto db_disk = getDisk();
-    String query = DB::readMetadataFile(db_disk, file_path);
+    /// Waits for the moves of an exchange with a record, like the other readers of metadata files.
+    String query = readObjectMetadataFile(table_name);
     return parseQueryFromMetadata(getContext(), getDatabaseName(), table_name, query, description);
 }
 
@@ -2877,9 +2881,9 @@ void DatabaseReplicated::adjustDigestOnTableLostFromRestart(const String & table
 
 String DatabaseReplicated::readMetadataFile(const String & table_name) const
 {
-    auto db_disk = getDisk();
-    auto file_path = getObjectMetadataPath(table_name);
-    return DB::readMetadataFile(db_disk, file_path);
+    /// Waits for the moves of an exchange with a record. `metadata_mutex` does not cover an exchange that another database runs,
+    /// such as an exchange of tables of two `Replicated` databases started on the other one.
+    return readObjectMetadataFile(table_name);
 }
 
 

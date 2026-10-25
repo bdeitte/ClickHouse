@@ -168,6 +168,10 @@ static struct InitFiu
     ONCE(database_atomic_exchange_fail_after_third_move) \
     REGULAR(database_atomic_exchange_always_fail_before_first_move) \
     REGULAR(database_atomic_exchange_fail_to_finish) \
+    REGULAR(database_atomic_exchange_probe_not_supported) \
+    REGULAR(database_atomic_exchange_probe_as_rename) \
+    PAUSEABLE_ONCE(database_atomic_exchange_pause_after_first_move) \
+    PAUSEABLE_ONCE(database_atomic_pause_before_reading_create_query) \
     REGULAR(dummy_failpoint) \
     ONCE(system_log_pipeline_fail_after_smt_restore) \
     REGULAR(prefetched_reader_pool_failpoint) \

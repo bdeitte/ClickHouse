@@ -544,10 +544,16 @@ A value of `0` means all cores.
 The delay during which a dropped table can be restored using the [`UNDROP`](/reference/statements/undrop) statement. If `DROP TABLE` ran with a `SYNC` modifier, the setting is ignored.
 The default for this setting is `480` (8 minutes).
 )", 0) \
-    DECLARE(Bool, database_atomic_allow_exchange_emulation, true, R"(
-On a local disk whose filesystem cannot exchange two files atomically (for example NFS), `Atomic` and `Replicated` databases emulate the exchange of two metadata files with three renames and a durable record, which keeps `EXCHANGE TABLES`, `EXCHANGE DICTIONARIES`, `REPLACE TABLE` and refreshes of refreshable materialized views crash-safe on such filesystems.
+    DECLARE(Bool, database_atomic_allow_exchange_emulation, false, R"(
+When enabled, on a local disk whose filesystem cannot exchange two files atomically (for example NFS), `Atomic` and `Replicated` databases emulate the exchange of two metadata files with three renames and a durable record, which keeps `EXCHANGE TABLES`, `EXCHANGE DICTIONARIES`, `REPLACE TABLE` and refreshes of refreshable materialized views crash-safe on such filesystems. When disabled, these statements fail on such filesystems with an error.
 
-Set to `0` to disable the emulation. These statements then fail on such filesystems with an error, as they did in ClickHouse versions 26.10 and earlier. Exchanges that a crash interrupted are still finished when the database loads, regardless of this setting.
+The emulation also lets these statements run where the operating system has no atomic exchange of files at all, which they otherwise refuse.
+
+With the emulation enabled, the first exchange in each database after the server starts writes two scratch files to the metadata directory to check whether the filesystem exchanges files atomically. If those files cannot be written, for example on a full disk, that exchange fails, even where the filesystem exchanges files atomically.
+
+Exchanges that a crash interrupted are finished when the database loads, regardless of this setting.
+
+After a crash, start the server once more before a downgrade to a ClickHouse version before 26.11, so that it finishes the interrupted exchanges. Those versions refuse to load a database that has the temporary file `<table>.sql.tmp_exchange` of such an exchange.
 )", 0) \
     DECLARE(UInt64, database_catalog_unused_dir_hide_timeout_sec, 60 * 60, R"(
 Parameter of a task that cleans up garbage from `store/` directory.

@@ -1,0 +1,10 @@
+database_atomic_exchange_probe_not_supported
+after the first exchange, has y: a
+after the second exchange, has y: b
+dot-files: 0
+exchanges with a record: 2	probe found no atomic exchange: 1	probe found no swap: 0
+database_atomic_exchange_probe_as_rename
+after the first exchange, has y: a
+after the second exchange, has y: b
+dot-files: 0
+exchanges with a record: 2	probe found no atomic exchange: 0	probe found no swap: 1

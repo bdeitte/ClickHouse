@@ -56,6 +56,10 @@ namespace FailPoints
     extern const char database_atomic_exchange_fail_after_third_move[];
     extern const char database_atomic_exchange_always_fail_before_first_move[];
     extern const char database_atomic_exchange_fail_to_finish[];
+    extern const char database_atomic_exchange_probe_not_supported[];
+    extern const char database_atomic_exchange_probe_as_rename[];
+    extern const char database_atomic_exchange_pause_after_first_move[];
+    extern const char database_atomic_pause_before_reading_create_query[];
 }
 
 namespace ErrorCodes
@@ -363,11 +367,19 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
     if (inside_database && table_name == to_table_name)
         return;
 
+    auto txn = local_context->getZooKeeperMetadataTransaction();
+    const bool has_keeper_transaction = txn && !local_context->isInternalSubquery();
+
+    /// Every exchange probes the filesystem first, even without a Keeper commit, where it could instead try `renameExchangeIfSupported`
+    /// on the metadata files and fall back to the record when that returns false. Some filesystems return success for an exchange
+    /// that they do as a plain rename, which overwrites the target: the Docker Desktop bind mounts on macOS do this. Tried on the
+    /// metadata files, such an exchange loses one of them before anything can check it. The probe exchanges two scratch files,
+    /// checks that their contents were swapped, and otherwise sends the exchange to the record. With a Keeper commit, the answer
+    /// is also needed before the commit, because the record is written before it.
+    /// The cost is that the first exchange in a database fails when the probe files cannot be written, such as on a full disk,
+    /// even where the filesystem exchanges files atomically. Later exchanges use the cached answer.
     /// Probe after `waitDatabaseStarted`, so that loading has removed the probe files a crash left,
     /// and before the locks of the databases, so that a probe does not hold them while it writes files.
-    /// The probe runs before the exchange, not after `renameExchangeIfSupported` returns false, because the record is written
-    /// before the Keeper commit. So the first exchange in a database fails when the probe files cannot be written, such as
-    /// on a full disk, even where the filesystem exchanges files atomically.
     bool use_record = false;
     if (can_emulate_exchange)
     {
@@ -442,12 +454,12 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
         record.old_path_content = readMetadataFile(db_disk, new_metadata_path);
         record.new_path_content = readMetadataFile(db_disk, old_metadata_path);
         std::lock_guard exchange_lock(metadataExchangeMutex());
+        /// When a later write fails, the records already in place stay, which is accepted: nothing has moved and there is
+        /// no temporary file, so the next load only removes them, and `DatabaseAtomic::drop` removes them with the directory.
         record_paths = writeMetadataExchangeRecords(db_disk, record, fsync);
     }
 
     /// Table renaming actually begins here
-    auto txn = local_context->getZooKeeperMetadataTransaction();
-    const bool has_keeper_transaction = txn && !local_context->isInternalSubquery();
     if (has_keeper_transaction)
     {
         try
@@ -594,6 +606,8 @@ void DatabaseAtomic::checkTablesCanBeAltered() const
 
 ASTPtr DatabaseAtomic::readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const
 {
+    /// Lets a test hold a reader that has passed `mutex` until an exchange is between its moves.
+    FailPointInjection::pauseFailPoint(FailPoints::database_atomic_pause_before_reading_create_query);
     std::shared_lock lock(metadata_files_mutex);
     return DatabaseOrdinary::readCreateQueryFromMetadataFile(table_name, throw_on_error);
 }
@@ -754,11 +768,38 @@ bool DatabaseAtomic::canExchangeAtomically()
     writeMetadataFile(db_disk, probe_path_1, "1", /* fsync_metadata */ false);
     writeMetadataFile(db_disk, probe_path_2, "2", /* fsync_metadata */ false);
     /// It returns `false` when the exchange is not supported, and throws on every other error, so an error leaves the answer unset.
-    exchange_is_atomic = db_disk->renameExchangeIfSupported(probe_path_1, probe_path_2);
-    if (!*exchange_is_atomic)
+    bool is_atomic = false;
+    bool probe_not_supported = false;
+    bool probe_as_rename = false;
+    fiu_do_on(FailPoints::database_atomic_exchange_probe_not_supported, { probe_not_supported = true; });
+    fiu_do_on(FailPoints::database_atomic_exchange_probe_as_rename, { probe_as_rename = true; });
+    if (probe_as_rename)
+    {
+        /// What a filesystem that reports success for an exchange it does as a plain rename leaves.
+        db_disk->replaceFile(probe_path_1, probe_path_2);
+        is_atomic = true;
+    }
+    else if (!probe_not_supported)
+    {
+        is_atomic = db_disk->renameExchangeIfSupported(probe_path_1, probe_path_2);
+    }
+
+    if (!is_atomic)
+    {
         LOG_INFO(log, "The filesystem of {} cannot exchange two files atomically, exchanges of metadata files will use a record",
             getMetadataPath());
-    return *exchange_is_atomic;
+    }
+    else if (!db_disk->existsFile(probe_path_1) || !db_disk->existsFile(probe_path_2)
+        || readMetadataFile(db_disk, probe_path_1) != "2" || readMetadataFile(db_disk, probe_path_2) != "1")
+    {
+        /// The exchange returned success but did not swap the files, so it is not trusted with metadata files. A filesystem that
+        /// does the exchange as a plain rename overwrites the second file and removes the first one, see `renameTable`.
+        LOG_WARNING(log, "The filesystem of {} reported an exchange of two files as done but did not swap them, "
+            "exchanges of metadata files will use a record", getMetadataPath());
+        is_atomic = false;
+    }
+    exchange_is_atomic = is_atomic;
+    return is_atomic;
 }
 
 void DatabaseAtomic::exchangeMetadataFilesWithRecord(
@@ -792,6 +833,8 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
             disk->moveFile(record.old_path, tmp_path);
             fiu_do_on(FailPoints::database_atomic_exchange_fail_after_first_move,
                 { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the first move of an exchange"); });
+            /// Lets a test hold the exchange while the first file is missing, to check that readers wait for the moves.
+            FailPointInjection::pauseFailPoint(FailPoints::database_atomic_exchange_pause_after_first_move);
             disk->moveFile(record.new_path, record.old_path);
             fiu_do_on(FailPoints::database_atomic_exchange_fail_after_second_move,
                 { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the second move of an exchange"); });
@@ -926,6 +969,10 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
             "its temporary table could not be dropped: after the restart, drop it if it is still there. "
             "Until the restart, `ReplicatedMergeTree` tables in the database cannot apply `ALTER` entries from other replicas, "
             "and the entries queued after them wait";
+        /// The fence refuses the entries of the database log and the recovery of the replica.
+        if (has_keeper_transaction)
+            hint += ". Until the restart, this replica of the `Replicated` database also stops applying the database log "
+                "once another replica writes to it, so queries on this replica that go through the log fail";
 
         unfinished_exchange = fmt::format("{} and {}", record.old_path, record.new_path);
         unfinished_exchange_hint = hint;
