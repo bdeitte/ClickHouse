@@ -86,6 +86,9 @@ public:
     void setDetachedTableNotInUseForce(const UUID & uuid) override;
 
 protected:
+    /// Finishes a swap that a crash interrupted, before `iterateMetadataFiles` processes any metadata file.
+    bool finishInterruptedMetadataExchangesAtLoad() const override;
+
     void commitAlterTable(const StorageID & table_id, const String & table_metadata_tmp_path, const String & table_metadata_path, const String & statement, ContextPtr query_context) override;
     void commitCreateTable(const ASTCreateQuery & query, const StoragePtr & table,
                            const String & table_metadata_tmp_path, const String & table_metadata_path, ContextPtr query_context) override;

@@ -44,8 +44,35 @@ std::optional<MetadataExchangeRecord> parseMetadataExchangeRecord(const String &
 String writeMetadataExchangeRecord(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync);
 
 /// Best effort: a record without its temporary file is harmless, and the next load removes it.
-/// A removal is logged at INFO when the load removes files a crash left (`found_at_load`),
-/// and at DEBUG for the routine cleanup after an exchange.
+/// A removal is logged at `INFO` when the load removes files a crash left (`found_at_load`),
+/// and at `DEBUG` for the routine cleanup after an exchange.
 void tryRemoveMetadataExchangeFiles(const DiskPtr & disk, const Strings & paths, const LoggerPtr & log, bool found_at_load) noexcept;
+
+/// Whether a file in a metadata directory is one that `finishInterruptedMetadataExchanges` acts on: a record, a leftover
+/// temporary record, a leftover write of a finish, or the temporary file of an exchange.
+bool isMetadataExchangeFileName(const String & file_name);
+
+enum class MetadataExchangeState : uint8_t
+{
+    /// No temporary file, and both files hold their contents from before the exchange.
+    BeforeExchange,
+    /// The temporary file holds the content recorded for `new_path`, and each of the two files is absent
+    /// or holds one of the two recorded contents.
+    Interrupted,
+    /// No temporary file, and both files hold their contents from after the exchange.
+    AfterExchange,
+    /// Anything else, including a missing file without the temporary file.
+    Inconsistent,
+};
+
+MetadataExchangeState inspectMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record);
+
+/// Writes each recorded content to `dir/.<file>.exchange_write` and puts it in place with `replaceFile`, then removes the temporary file.
+void finishMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync);
+
+/// Called when a database on `disk` is loaded. Removes leftover temporary records and writes of a finish in `metadata_dir`,
+/// finishes the interrupted exchanges recorded there, and removes their records.
+/// Throws `CORRUPTED_DATA` and leaves the files as they are when an exchange cannot be finished safely.
+void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & metadata_dir, bool fsync, const LoggerPtr & log);
 
 }

@@ -19,6 +19,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CANNOT_PARSE_ESCAPE_SEQUENCE;
+    extern const int CORRUPTED_DATA;
 }
 
 namespace
@@ -26,7 +27,39 @@ namespace
 
 constexpr auto exchange_record_suffix = ".exchange";
 constexpr auto exchange_record_header = "exchange v1";
+constexpr auto exchange_write_suffix = ".exchange_write";
 
+std::optional<String> readMetadataFileIfExists(const DiskPtr & disk, const String & path)
+{
+    if (!disk->existsFile(path))
+        return {};
+    return readMetadataFile(disk, path);
+}
+
+/// `dir/a.sql` -> `dir/.a.sql.exchange_write`. Not `a.sql.tmp`, which `ALTER` writes before it takes the database mutex,
+/// so a roll forward during a concurrent `ALTER` of the same table could put the `ALTER`'s content in place of the recorded one.
+String metadataExchangeWritePath(const String & metadata_file_path)
+{
+    fs::path path(metadata_file_path);
+    return (path.parent_path() / ("." + path.filename().string() + exchange_write_suffix)).string();
+}
+
+void replaceMetadataFile(const DiskPtr & disk, const String & path, const String & content, bool fsync)
+{
+    const String write_path = metadataExchangeWritePath(path);
+    writeMetadataFile(disk, write_path, content, fsync);
+    disk->replaceFile(write_path, path);
+}
+
+}
+
+bool isMetadataExchangeFileName(const String & file_name)
+{
+    const String record_suffix = String(".sql") + exchange_record_suffix;
+    if (!file_name.starts_with('.'))
+        return file_name.ends_with(String(".sql") + metadata_exchange_tmp_suffix);
+    return file_name.ends_with(record_suffix) || file_name.ends_with(record_suffix + ".tmp")
+        || file_name.ends_with(String(".sql") + exchange_write_suffix);
 }
 
 String metadataExchangeRecordPath(const String & metadata_file_path)
@@ -106,6 +139,106 @@ void tryRemoveMetadataExchangeFiles(const DiskPtr & disk, const Strings & paths,
         {
             tryLogCurrentException(log, fmt::format("Cannot remove {}", path));
         }
+    }
+}
+
+MetadataExchangeState inspectMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record)
+{
+    const auto old_path_current = readMetadataFileIfExists(disk, record.old_path);
+    const auto new_path_current = readMetadataFileIfExists(disk, record.new_path);
+
+    /// The temporary file exists only between the first and the last move, and holds what `new_path` holds after the exchange.
+    if (const auto tmp_current = readMetadataFileIfExists(disk, metadataExchangeTmpPath(record.old_path)))
+    {
+        auto is_absent_or_recorded = [&](const std::optional<String> & current)
+        {
+            return !current || *current == record.old_path_content || *current == record.new_path_content;
+        };
+        if (*tmp_current == record.new_path_content && is_absent_or_recorded(old_path_current) && is_absent_or_recorded(new_path_current))
+            return MetadataExchangeState::Interrupted;
+        return MetadataExchangeState::Inconsistent;
+    }
+
+    if (old_path_current == record.old_path_content && new_path_current == record.new_path_content)
+        return MetadataExchangeState::AfterExchange;
+    if (old_path_current == record.new_path_content && new_path_current == record.old_path_content)
+        return MetadataExchangeState::BeforeExchange;
+    return MetadataExchangeState::Inconsistent;
+}
+
+void finishMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync)
+{
+    replaceMetadataFile(disk, record.old_path, record.old_path_content, fsync);
+    replaceMetadataFile(disk, record.new_path, record.new_path_content, fsync);
+    /// Last, so that a crash before it leaves the exchange `Interrupted` and the next load finishes it again.
+    disk->removeFileIfExists(metadataExchangeTmpPath(record.old_path));
+}
+
+void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & metadata_dir, bool fsync, const LoggerPtr & log)
+{
+    /// The directory is scanned without a mutex: a database's own load cannot overlap its swaps.
+    /// At server start, the load runs before the server accepts queries. `ATTACH DATABASE` holds the exclusive DDL guard
+    /// of the database while it loads, and every table DDL guard takes that guard's mutex in shared mode first.
+    const String record_suffix = String(".sql") + exchange_record_suffix;
+    const String record_tmp_suffix = record_suffix + ".tmp";
+    const String write_suffix = String(".sql") + exchange_write_suffix;
+    /// `metadata_dir` ends with a slash, and `parent_path` of a file in it does not.
+    const fs::path dir = (fs::path(metadata_dir) / "x").parent_path();
+    Strings record_paths;
+    Strings leftover_paths;
+    for (const auto it = disk->iterateDirectory(metadata_dir); it->isValid(); it->next())
+    {
+        const String file_name = it->name();
+        if (!file_name.starts_with('.'))
+            continue;
+        const String path = (fs::path(metadata_dir) / file_name).string();
+        if (file_name.ends_with(record_suffix))
+            record_paths.push_back(path);
+        else if (file_name.ends_with(record_tmp_suffix) || file_name.ends_with(write_suffix))
+            leftover_paths.push_back(path);
+    }
+
+    /// A record is complete before its exchange begins, so a leftover temporary record belongs to an exchange that did not begin.
+    /// A leftover write of a finish belongs to an exchange whose temporary file is still there, so finishing it below writes it again.
+    tryRemoveMetadataExchangeFiles(disk, leftover_paths, log, /* found_at_load */ true);
+
+    for (const auto & record_path : record_paths)
+    {
+        const auto content = readMetadataFileIfExists(disk, record_path);
+        if (!content)
+            continue;
+
+        const auto record = parseMetadataExchangeRecord(*content);
+        if (!record
+            || record_path != metadataExchangeRecordPath(record->old_path)
+            || fs::path(record->old_path).parent_path() != dir
+            || fs::path(record->new_path).parent_path() != dir)
+        {
+            LOG_WARNING(log, "{} is not an exchange record, leaving it as is", record_path);
+            continue;
+        }
+
+        /// Without the temporary file, the moves either did not begin or all finished, and the record only has to be removed.
+        /// The files are not compared with the record here: they can legitimately hold neither recorded state,
+        /// for example after an `ALTER` that followed an exchange whose record was not removed.
+        if (disk->existsFile(metadataExchangeTmpPath(record->old_path)))
+        {
+            if (inspectMetadataExchange(disk, *record) != MetadataExchangeState::Interrupted)
+                throw Exception(
+                    ErrorCodes::CORRUPTED_DATA,
+                    "Cannot finish the interrupted exchange of {} and {} recorded in {}: the temporary file {} or one of the two files "
+                    "holds none of the recorded contents. The files are left as they are. To repair manually, compare the two files "
+                    "and the temporary file with the two contents in the record, restore the intended content of each of the two "
+                    "files, remove the record and the temporary file, and load the database again",
+                    record->old_path, record->new_path, record_path, metadataExchangeTmpPath(record->old_path));
+
+            finishMetadataExchange(disk, *record, fsync);
+            LOG_WARNING(
+                log, "Finished the interrupted exchange of {} and {}, and removed the temporary file {}",
+                record->old_path, record->new_path, metadataExchangeTmpPath(record->old_path));
+        }
+
+        tryRemoveMetadataExchangeFiles(disk, {record_path}, log, /* found_at_load */ true);
     }
 }
 

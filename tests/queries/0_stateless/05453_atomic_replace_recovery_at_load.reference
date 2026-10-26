@@ -1,0 +1,55 @@
+case 1: the record only, before the swap
+a: x
+b: x,y
+
+case 2: after the first move
+a: x,y
+b: x
+
+case 3: after the second move
+a: x,y
+b: x
+
+case 4: after the third move
+a: x,y
+b: x
+
+case 5: a leftover temporary record and a leftover write of a finish
+a: x
+b: x,y
+
+case 6: the record only, and a metadata file that changed after it
+a: x,z
+b: x,y
+
+case 7: the temporary file, and a metadata file with neither of the recorded contents
+CORRUPTED_DATA
+.a.sql.exchange
+the temporary file is untouched
+a.sql is untouched
+b.sql is untouched
+a: x
+b: x,y
+
+case 8: a temporary file with neither of the recorded contents, after the first move
+CORRUPTED_DATA
+.a.sql.exchange
+the temporary file is untouched
+b.sql is untouched
+a.sql is missing
+a: x
+b: x,y
+
+case 9: the temporary file without a record
+no valid exchange record is next to it
+INCORRECT_FILE_NAME
+the temporary file is left
+
+case 10: a record whose path is not the record path of its old path
+no valid exchange record is next to it
+INCORRECT_FILE_NAME
+.a.sql.exchange
+a.sql is untouched
+b.sql is untouched
+a: x
+b: x,y

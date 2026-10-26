@@ -641,6 +641,21 @@ void DatabaseAtomic::beforeLoadingMetadata(ContextMutablePtr /*context*/, Loadin
     }
 }
 
+bool DatabaseAtomic::finishInterruptedMetadataExchangesAtLoad() const
+{
+    /// This does not read the server setting `database_atomic_allow_exchange_emulation`: a crash can leave files of a swap
+    /// after the setting was turned off, and the load must still finish it.
+    /// `DatabaseReplicated` derives from `DatabaseAtomic` and is excluded, so it keeps refusing a temporary file of a swap.
+    if (typeid(*this) != typeid(DatabaseAtomic))
+        return false;
+    auto db_disk = getDisk();
+    if (!canEmulateExchange(db_disk) || db_disk->isReadOnly())
+        return false;
+    const bool fsync = getContext()->getGlobalContext()->getSettingsRef()[Setting::fsync_metadata];
+    finishInterruptedMetadataExchanges(db_disk, getMetadataPath(), fsync, log);
+    return true;
+}
+
 bool DatabaseAtomic::canEmulateExchange(const DiskPtr & disk)
 {
     return dynamic_cast<const DiskLocal *>(disk.get()) != nullptr;

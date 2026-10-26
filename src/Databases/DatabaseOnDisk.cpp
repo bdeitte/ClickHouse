@@ -11,6 +11,7 @@
 #include <Core/UUID.h>
 #include <Databases/DatabaseAtomic.h>
 #include <Databases/DatabaseOrdinary.h>
+#include <Databases/MetadataExchange.h>
 #include <Disks/DiskLocal.h>
 #include <Disks/IDisk.h>
 #include <IO/ReadBufferFromFile.h>
@@ -797,46 +798,85 @@ void DatabaseOnDisk::iterateMetadataFiles(const IteratingFunction & process_meta
     /// Metadata files to load: name and flag for .tmp_drop files
     std::vector<std::pair<String, bool>> metadata_files;
 
-    for (const auto it = db_disk->iterateDirectory(metadata_path); it->isValid(); it->next())
+    /// The files of swaps of metadata files with a record that a crash interrupted, see `finishInterruptedMetadataExchangesAtLoad`.
+    bool has_exchange_files = false;
+    String exchange_tmp_file_name;
+
+    auto list_metadata_files = [&]
     {
-        auto sub_path = fs::path(it->path());
-        String file_name = it->name();
-        /// For '.svn', '.gitignore' directory and similar.
-        if (!file_name.empty() && file_name.at(0) == '.')
-            continue;
+        metadata_files.clear();
+        has_exchange_files = false;
+        exchange_tmp_file_name.clear();
+        for (const auto it = db_disk->iterateDirectory(metadata_path); it->isValid(); it->next())
+        {
+            auto sub_path = fs::path(it->path());
+            String file_name = it->name();
+            if (isMetadataExchangeFileName(file_name))
+            {
+                has_exchange_files = true;
+                if (!file_name.starts_with('.'))
+                    exchange_tmp_file_name = file_name;
+                continue;
+            }
 
-        /// There are .sql.bak files - skip them.
-        if (endsWith(file_name, ".sql.bak"))
-            continue;
+            /// For '.svn', '.gitignore' directory and similar.
+            if (!file_name.empty() && file_name.at(0) == '.')
+                continue;
 
-        /// Permanently detached table flag
-        if (endsWith(file_name, ".sql.detached"))
-            continue;
+            /// There are .sql.bak files - skip them.
+            if (endsWith(file_name, ".sql.bak"))
+                continue;
 
-        if (endsWith(file_name, ".sql.tmp_drop"))
-        {
-            /// There are files that we tried to delete previously
-            metadata_files.emplace_back(file_name, false);
+            /// Permanently detached table flag
+            if (endsWith(file_name, ".sql.detached"))
+                continue;
+
+            if (endsWith(file_name, ".sql.tmp_drop"))
+            {
+                /// There are files that we tried to delete previously
+                metadata_files.emplace_back(file_name, false);
+            }
+            else if (endsWith(file_name, ".tmp_move_from") || endsWith(file_name, ".tmp_move_to"))
+            {
+                /// There are temp files generated in MetadataStorageFromPlainObjectStorageMoveFileOperation
+                LOG_INFO(log, "Removing file {}", sub_path.string());
+                db_disk->removeFileIfExists(sub_path);
+            }
+            else if (endsWith(file_name, ".sql.tmp"))
+            {
+                /// There are files .sql.tmp - delete
+                LOG_INFO(log, "Removing file {}", sub_path.string());
+                db_disk->removeFileIfExists(sub_path);
+            }
+            else if (endsWith(file_name, ".sql"))
+            {
+                /// The required files have names like `table_name.sql`
+                metadata_files.emplace_back(file_name, true);
+            }
+            else
+                throw Exception(ErrorCodes::INCORRECT_FILE_NAME, "Incorrect file extension: {} in metadata directory {}", file_name, getMetadataPath());
         }
-        else if (endsWith(file_name, ".tmp_move_from") || endsWith(file_name, ".tmp_move_to"))
-        {
-            /// There are temp files generated in MetadataStorageFromPlainObjectStorageMoveFileOperation
-            LOG_INFO(log, "Removing file {}", sub_path.string());
-            db_disk->removeFileIfExists(sub_path);
-        }
-        else if (endsWith(file_name, ".sql.tmp"))
-        {
-            /// There are files .sql.tmp - delete
-            LOG_INFO(log, "Removing file {}", sub_path.string());
-            db_disk->removeFileIfExists(sub_path);
-        }
-        else if (endsWith(file_name, ".sql"))
-        {
-            /// The required files have names like `table_name.sql`
-            metadata_files.emplace_back(file_name, true);
-        }
-        else
-            throw Exception(ErrorCodes::INCORRECT_FILE_NAME, "Incorrect file extension: {} in metadata directory {}", file_name, getMetadataPath());
+    };
+
+    list_metadata_files();
+    const bool finished_exchanges = has_exchange_files && finishInterruptedMetadataExchangesAtLoad();
+    /// The files are listed again because a crash after the first move leaves one `.sql` file missing until the finish puts it back.
+    if (finished_exchanges)
+        list_metadata_files();
+
+    if (!exchange_tmp_file_name.empty())
+    {
+        if (finished_exchanges)
+            throw Exception(ErrorCodes::INCORRECT_FILE_NAME,
+                "The temporary file {} of an exchange of metadata files that was not finished is left in metadata directory {}, "
+                "and no valid exchange record is next to it: the record is missing, or a warning in the log reports that it is not "
+                "an exchange record. To repair manually, restore the intended "
+                "content of the two files of the exchange, remove the temporary file, and load the database again",
+                exchange_tmp_file_name, getMetadataPath());
+        throw Exception(ErrorCodes::INCORRECT_FILE_NAME,
+            "The temporary file {} of an exchange of metadata files that was not finished is left in metadata directory {}. "
+            "A load finishes the exchange from its record only in an `Atomic` database on a local disk that is writable",
+            exchange_tmp_file_name, getMetadataPath());
     }
 
     std::sort(metadata_files.begin(), metadata_files.end());
