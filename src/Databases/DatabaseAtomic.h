@@ -100,8 +100,8 @@ public:
     std::vector<std::pair<ASTPtr, StoragePtr>> getTablesForBackup(const FilterByNameFunction & filter, const ContextPtr & local_context) const override;
 
 protected:
-    /// Finishes a swap that a crash interrupted, before `iterateMetadataFiles` processes any metadata file.
-    bool finishInterruptedMetadataExchangesAtLoad() const override;
+    /// Undoes a swap that a crash or a fence interrupted, before `iterateMetadataFiles` processes any metadata file.
+    bool undoInterruptedMetadataExchangesAtLoad() const override;
 
     /// Waits for the moves of a swap with a record, see `metadata_files_mutex`. Refuses the tables of an unfinished exchange,
     /// or returns `nullptr` for them when `throw_on_error` is `false`.
@@ -143,21 +143,22 @@ private:
     /// A swap takes it while it holds `mutex`, so a reader must not take `mutex` while it holds this mutex.
     mutable SharedMutex metadata_files_mutex;
 
-    /// Exchanges the two metadata files of `record` in this database with three moves, instead of an atomic exchange,
-    /// and then removes the record at `record_path` that `writeMetadataExchangeRecord` wrote. When a move fails and the
-    /// exchange can be neither retried nor finished from the record, it keeps the record and fences the two tables,
-    /// see `fenceUnfinishedExchange`. The caller holds `mutex` and the DDL guards of `table_name` and `other_table_name`.
+    /// Writes `record` with `writeMetadataExchangeRecord`, exchanges the two metadata files of `record` in this database with three
+    /// moves, instead of an atomic exchange, and then removes the record. The caller renames the tables in memory only after this
+    /// returns, so a record on disk means that its exchange did not reach the tables in memory, and the next load undoes it, see
+    /// `undoInterruptedMetadataExchanges`. When a move fails and the exchange can be neither retried nor finished from the record,
+    /// or when the record cannot be removed, it leaves the record and fences the two tables, see `fenceUnfinishedExchange`.
+    /// The caller holds `mutex` and the DDL guards of `table_name` and `other_table_name`.
     void exchangeMetadataFilesWithRecord(
         const String & table_name,
         const String & other_table_name,
         const DiskPtr & disk,
         const MetadataExchangeRecord & record,
-        const String & record_path,
         bool fsync) TSA_REQUIRES(mutex);
 
     /// Fences an exchange that failed and could not be finished: adds `table_name` and `other_table_name` to `unfinished_exchanges`,
-    /// then rethrows `error`. `hint` tells what the restart does about the metadata files `files`. This function adds what the fence
-    /// refuses until then and where the rows inserted until then end up, and adds the result to `error`.
+    /// then rethrows `error`. `hint` tells what the restart does about the metadata files `files` and where the rows inserted
+    /// until then end up. This function adds what the fence refuses and accepts until then, and adds the result to `error`.
     [[noreturn]] void fenceUnfinishedExchange(
         const String & table_name,
         const String & other_table_name,
@@ -184,10 +185,9 @@ private:
 
     /// Set when an exchange of two metadata files with a record failed and could not be finished, so the files of its two tables
     /// may be half exchanged. By table name. Until the server restarts, DDL on the two tables and reads of their definitions fail,
-    /// and so do `DROP DATABASE` and `DETACH DATABASE`. When the temporary file of the exchange is left, the next load finishes the
-    /// exchange from its record, or reports `CORRUPTED_DATA` when the files hold none of the recorded contents. Without it, the load
-    /// removes the record and leaves the files as they are. Inserts are not refused: until the restart, they reach the tables as they
-    /// were before the exchange.
+    /// and so do `DROP DATABASE`, `DETACH DATABASE` and `TRUNCATE DATABASE`. The record of the exchange is left, and the next load
+    /// undoes the exchange from it, or reports `CORRUPTED_DATA` when the files hold none of the recorded contents. Inserts are not
+    /// refused: until the restart, they reach the tables as they were before the exchange.
     std::map<String, UnfinishedExchange> unfinished_exchanges TSA_GUARDED_BY(mutex);
 
     /// Whether `unfinished_exchanges` is not empty. Set by `fenceUnfinishedExchange` and never cleared, like the fence. While it is

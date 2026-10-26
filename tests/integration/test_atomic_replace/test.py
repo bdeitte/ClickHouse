@@ -114,17 +114,30 @@ def nfs_mounted():
     ip = cluster.get_instance_ip("nfs1")
     node.exec_in_container(["mkdir", "-p", NFS_DISK_PATH], user="root")
     node.exec_in_container(
-        ["mount", "-t", "nfs4", "-o", f"vers=4.2,soft,addr={ip}", f"{ip}:/", NFS_DISK_PATH],
+        [
+            "mount",
+            "-t",
+            "nfs4",
+            "-o",
+            f"vers=4.2,soft,addr={ip}",
+            f"{ip}:/",
+            NFS_DISK_PATH,
+        ],
         user="root",
     )
     try:
         # The server may run as the user of the test runner, which owns nothing on the export.
         node.exec_in_container(["chmod", "0777", NFS_DISK_PATH], user="root")
-        assert node.exec_in_container(["stat", "-f", "-c", "%T", NFS_DISK_PATH]).strip() == "nfs"
+        assert (
+            node.exec_in_container(["stat", "-f", "-c", "%T", NFS_DISK_PATH]).strip()
+            == "nfs"
+        )
         yield
     finally:
         # Lazy, so that a server that went away cannot hang the teardown.
-        node.exec_in_container(["umount", "-l", NFS_DISK_PATH], user="root", nothrow=True)
+        node.exec_in_container(
+            ["umount", "-l", NFS_DISK_PATH], user="root", nothrow=True
+        )
 
 
 def test_swap_on_nfs(started_cluster):
@@ -154,7 +167,9 @@ def test_swap_on_nfs(started_cluster):
 
             # A refresh of a view with an inner table that is not `APPEND` swaps the `.tmp` table it fills with the inner
             # table. The view starts stopped, because of `stop_refreshable_materialized_views_on_startup`.
-            node.query("CREATE TABLE nfs_db.src (x UInt8) ENGINE = MergeTree ORDER BY x")
+            node.query(
+                "CREATE TABLE nfs_db.src (x UInt8) ENGINE = MergeTree ORDER BY x"
+            )
             node.query("INSERT INTO nfs_db.src VALUES (7)")
             node.query(
                 "CREATE MATERIALIZED VIEW nfs_db.mv REFRESH EVERY 1 YEAR"
@@ -175,7 +190,7 @@ def test_swap_on_nfs(started_cluster):
             assert exchange_files(list_files(nfs_db_dir)) == []
 
             # A crash between the moves of a swap: the server is killed while `c.sql` is missing, and the load at the restart
-            # finishes the swap from the record.
+            # undoes the swap from the record.
             node.query("CREATE TABLE nfs_db.c (x UInt8) ENGINE = MergeTree ORDER BY x")
             node.query("INSERT INTO nfs_db.c VALUES (1)")
             node.query(
@@ -191,7 +206,9 @@ def test_swap_on_nfs(started_cluster):
             )
             files = list_files(nfs_db_dir)
             assert "c.sql" not in files, files
-            assert len([name for name in files if name.endswith(".tmp_exchange")]) == 1, files
+            assert (
+                len([name for name in files if name.endswith(".tmp_exchange")]) == 1
+            ), files
             node.stop_clickhouse(kill=True)
             # The client lost its connection to the killed server.
             request.get_answer_and_error()
@@ -200,18 +217,18 @@ def test_swap_on_nfs(started_cluster):
             # Only for `nfs_db`, which is the database of this swap.
             assert (
                 node.count_in_log(
-                    f"Finished the interrupted exchange of store/.*{nfs_db_uuid}"
+                    f"Undid the interrupted exchange of store/.*{nfs_db_uuid}"
                 ).strip()
                 == "1"
             )
-            assert node.query("SELECT * FROM nfs_db.c") == "2\t3\n"
-            # The crash came before the `DROP` of the replaced table, so it is left under the temporary name.
+            assert node.query("SELECT * FROM nfs_db.c") == "1\n"
+            # The query did not finish, so the replacement table is left under the temporary name.
             tmp_tables = node.query(
                 "SELECT name FROM system.tables"
                 " WHERE database = 'nfs_db' AND startsWith(name, '_tmp_replace_')"
             ).split()
             assert len(tmp_tables) == 1, tmp_tables
-            assert node.query(f"SELECT x FROM nfs_db.`{tmp_tables[0]}`") == "1\n"
+            assert node.query(f"SELECT * FROM nfs_db.`{tmp_tables[0]}`") == "2\t3\n"
             assert exchange_files(list_files(nfs_db_dir)) == []
             node.query(f"DROP TABLE nfs_db.`{tmp_tables[0]}` SYNC")
 

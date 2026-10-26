@@ -5,7 +5,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$CUR_DIR"/../shell_config.sh
 
 # When a swap of metadata files with a record fails and cannot be finished, DDL on its two tables and reads of their
-# definitions are fenced until the restart, and the load at the restart finishes the swap whatever the server setting is.
+# definitions are fenced until the restart, and the load at the restart undoes the swap whatever the server setting is.
 # A last start with the setting off checks that a swap is then not emulated and leaves nothing behind.
 # Each run of `clickhouse-local` on the same path is a start of the server, and its failpoints are local to it.
 # The failpoint `database_atomic_exchange_not_supported` makes the filesystem report that it cannot exchange files.
@@ -79,8 +79,9 @@ local_query 1 "
     TRUNCATE TABLES FROM d LIKE '_tmp_replace_%'; -- { serverError UNFINISHED_METADATA_EXCHANGE }
     DROP DATABASE d; -- { serverError UNFINISHED_METADATA_EXCHANGE }
     DETACH DATABASE d; -- { serverError UNFINISHED_METADATA_EXCHANGE }
+    TRUNCATE DATABASE d; -- { serverError UNFINISHED_METADATA_EXCHANGE }
     SELECT 'the error of the fence says what the restart does: '
-        || toString(last_error_message LIKE '%until the server restarts%the next load finishes the exchange%')
+        || toString(last_error_message LIKE '%until the server restarts%the next load undoes the exchange%')
     FROM system.errors WHERE name = 'UNFINISHED_METADATA_EXCHANGE';
     -- The definitions of the two tables cannot be read.
     SELECT 'unreadable definitions: ' || toString(count()) FROM system.tables
@@ -113,26 +114,32 @@ echo "the error of the swap says what the restart does: $(grep -c 'until the ser
 print_swap_files "$DIR"
 
 echo
-echo "the start that finishes the swaps, with the setting off"
+echo "the start that undoes the swaps, with the setting off"
 local_query 0 "
     SELECT 'warnings: ' || toString(count()) FROM system.warnings WHERE message LIKE '%could not be finished%';
+    -- The load undid the swap of CREATE OR REPLACE, so t is the table from before it, with the row inserted under the fence.
     SELECT 't: ' || arrayStringConcat(arrayMap(c -> c.2, arraySort(groupArray((position, name)))), ',')
     FROM system.columns WHERE database = 'd' AND table = 't';
-    -- The row inserted under the fence went to the table that the swap replaced, so it is not in t.
-    SELECT 't rows: ' || formatRowNoNewline('CSV', *) FROM d.t;
-    -- The fence refused the cleanup DROP of the temporary table, so the replaced table is still there under the temporary
-    -- name, with the row inserted under the fence.
-    SELECT 'replaced table rows: ' || arrayStringConcat(groupArray(toString(x)), ',')
-    FROM (SELECT x FROM merge('d', '^_tmp_replace_') ORDER BY x);
+    SELECT 't rows: ' || arrayStringConcat(groupArray(toString(x)), ',') FROM (SELECT x FROM d.t ORDER BY x);
+    -- The fence refused the cleanup DROP of the temporary table, so the replacement table is still there under the temporary
+    -- name, with the row of its AS SELECT.
+    SELECT 'replacement table: ' || arrayStringConcat(arrayMap(c -> c.2, arraySort(groupArray((position, name)))), ',')
+    FROM system.columns WHERE database = 'd' AND startsWith(table, '_tmp_replace_');
+    SELECT 'replacement table rows: ' || formatRowNoNewline('CSV', *) FROM merge('d', '^_tmp_replace_');
     -- The fence is gone.
     ALTER TABLE d.t ADD COLUMN z UInt8;
     TRUNCATE TABLES FROM d LIKE '_tmp_replace_%';
-    SELECT 'replaced table rows after TRUNCATE: ' || toString(count()) FROM merge('d', '^_tmp_replace_');
-    -- The load also finished the swap of the refresh: the view reads the refreshed row, and the .tmp table that the fence
-    -- kept is the inner table from before the refresh, which was empty.
-    SELECT 'mv rows: ' || arrayStringConcat(groupArray(toString(x)), ',') FROM d.mv;
+    SELECT 'replacement table rows after TRUNCATE: ' || toString(count()) FROM merge('d', '^_tmp_replace_');
+    -- The load also undid the swap of the refresh: the view still reads its inner table from before the refresh, which was
+    -- empty, and the .tmp table that the fence kept holds the refreshed row.
+    SELECT 'mv rows: ' || toString(count()) FROM d.mv;
     SELECT 'leftover .tmp table rows: ' || toString(count()) FROM d.\"$TMP_INNER\";
-    -- DROP VIEW drops the inner table and the leftover .tmp table.
+    -- The first refresh after the restart replaces the leftover .tmp table, as the error of the fence says.
+    SYSTEM START VIEW d.mv;
+    SYSTEM REFRESH VIEW d.mv;
+    SYSTEM WAIT VIEW d.mv;
+    SELECT 'mv rows after a refresh: ' || arrayStringConcat(groupArray(toString(x)), ',') FROM d.mv;
+    -- DROP VIEW drops the inner table, and the .tmp table if it is left.
     DROP VIEW d.mv SYNC;
     SELECT 'inner tables: ' || toString(count()) FROM system.tables WHERE database = 'd' AND startsWith(name, '.');
 "

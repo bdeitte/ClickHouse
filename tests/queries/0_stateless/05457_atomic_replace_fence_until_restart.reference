@@ -10,14 +10,16 @@ the error of the swap says what the restart does: 1
 dot-files: 2
 temporary files: 2
 
-the start that finishes the swaps, with the setting off
+the start that undoes the swaps, with the setting off
 warnings: 0
-t: x,y
-t rows: 2,3
-replaced table rows: 1,5
-replaced table rows after TRUNCATE: 0
-mv rows: 7
-leftover .tmp table rows: 0
+t: x
+t rows: 1,5
+replacement table: x,y
+replacement table rows: 2,3
+replacement table rows after TRUNCATE: 0
+mv rows: 0
+leftover .tmp table rows: 1
+mv rows after a refresh: 7
 inner tables: 0
 dot-files: 0
 temporary files: 0

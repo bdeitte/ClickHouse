@@ -168,6 +168,10 @@ static struct InitFiu
     ONCE(database_atomic_exchange_fail_after_third_move) \
     REGULAR(database_atomic_exchange_always_fail_before_first_move) \
     REGULAR(database_atomic_exchange_fail_to_finish) \
+    ONCE(database_atomic_exchange_fail_after_finish) \
+    ONCE(database_atomic_exchange_fail_after_writing_record) \
+    REGULAR(database_atomic_exchange_fail_to_remove_record) \
+    ONCE(database_atomic_exchange_fail_to_sync_removed_record) \
     PAUSEABLE_ONCE(database_atomic_exchange_pause_after_second_move) \
     PAUSEABLE_ONCE(database_atomic_pause_before_reading_create_query) \
     REGULAR(dummy_failpoint) \

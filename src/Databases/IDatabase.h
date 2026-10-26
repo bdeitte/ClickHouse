@@ -562,7 +562,7 @@ public:
     /// `DatabaseCatalog::getDDLGuard` calls it for the name it guards, and `DatabaseCatalog::tryGetDDLGuard` once it owns the lock
     /// of the name, before the query changes anything. An exchange sets this state only while it holds the DDL guards of both
     /// of its names, so the answer does not change while the guard is held.
-    /// `DROP DATABASE` and `DETACH DATABASE` call it with an empty name. A database that wraps others, such as `DatabaseOverlay`,
+    /// `DROP DATABASE`, `DETACH DATABASE` and `TRUNCATE DATABASE` call it with an empty name. A database that wraps others, such as `DatabaseOverlay`,
     /// must ask the databases it wraps.
     virtual void checkNoUnfinishedExchange(const String & /*table_name*/) const {}
 

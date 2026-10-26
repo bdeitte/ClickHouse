@@ -124,8 +124,8 @@ protected:
     void iterateMetadataFiles(const IteratingFunction & process_metadata_file) const;
 
     /// Called by `iterateMetadataFiles` when the metadata directory has files of swaps of metadata files with a record,
-    /// before any metadata file is processed. Returns whether it finished the swaps, so that the files are listed again.
-    virtual bool finishInterruptedMetadataExchangesAtLoad() const { return false; }
+    /// before any metadata file is processed. Returns whether it undid the swaps, so that the files are listed again.
+    virtual bool undoInterruptedMetadataExchangesAtLoad() const { return false; }
 
     ASTPtr getCreateDatabaseQueryImpl() const override TSA_REQUIRES(mutex);
     ASTPtr getCreateTableQueryImpl(

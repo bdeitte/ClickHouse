@@ -4,7 +4,8 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-# Loading an `Atomic` database finishes the swaps of metadata files that a crash interrupted.
+# Loading an `Atomic` database undoes each swap of metadata files whose record is left: a swap removes its record before it renames
+# the tables in memory, so a record means that the swap did not reach them.
 # Each case writes the files that an interrupted swap leaves in the metadata directory of a database of `clickhouse-local`,
 # then starts `clickhouse-local` on the same path again, which loads the database as a server start does.
 # The metadata is in the path of `clickhouse-local`, on a local disk, whatever disks the server has.
@@ -44,13 +45,14 @@ SAVED="${CLICKHOUSE_TMP}/${CLICKHOUSE_TEST_UNIQUE_NAME}"
 A="${SAVED}_a.sql"
 B="${SAVED}_b.sql"
 CHANGED="${SAVED}_changed.sql"
+ALTERED="${SAVED}_altered.sql"
 cp "$DIR/a.sql" "$A"
 cp "$DIR/b.sql" "$B"
 sed "s/UUID '[0-9a-f-]*'/UUID '00000000-0000-0000-0000-000000000001'/" "$A" > "$CHANGED"
 
 function cleanup()
 {
-    rm -f -- "$A" "$B" "$CHANGED"
+    rm -f -- "$A" "$B" "$CHANGED" "$ALTERED"
 }
 trap cleanup EXIT
 
@@ -148,7 +150,7 @@ if [ -f "$DIR/a.sql.tmp_exchange" ]; then echo "the temporary file is left"; fi
 echo
 restore_main
 
-echo "case 4: after the third move"
+echo "case 4: after the third move, before the record is removed"
 main_record > "$DIR/.a.sql.exchange"
 cp "$B" "$DIR/a.sql"
 cp "$A" "$DIR/b.sql"
@@ -167,7 +169,14 @@ restore_main
 
 echo "case 6: the record only, and a metadata file that changed after it"
 local_query "ALTER TABLE d.a ADD COLUMN z UInt8"
+cp "$DIR/a.sql" "$ALTERED"
 main_record > "$DIR/.a.sql.exchange"
+load_and_print_error CORRUPTED_DATA
+print_dot_files "$DIR"
+print_same "a.sql" "$DIR/a.sql" "$ALTERED"
+print_same "b.sql" "$DIR/b.sql" "$B"
+# Repair by hand, as the error says: the files hold the intended contents, so only the record is removed.
+remove_case_files "$DIR"
 load_and_print_tables
 print_dot_files "$DIR"
 echo
@@ -224,3 +233,16 @@ print_same "a.sql" "$DIR/a.sql" "$A"
 print_same "b.sql" "$DIR/b.sql" "$B"
 remove_case_files "$DIR"
 load_and_print_tables
+echo
+restore_main
+
+echo "case 11: a crash during the undo of a swap whose moves all finished"
+# The undo writes the temporary file first, and then `a.sql` with its content from before the swap, so a crash after that
+# leaves both files with that content.
+main_record > "$DIR/.a.sql.exchange"
+cp "$A" "$DIR/a.sql.tmp_exchange"
+cp "$A" "$DIR/a.sql"
+cp "$A" "$DIR/b.sql"
+load_and_print_tables
+print_dot_files "$DIR"
+if [ -f "$DIR/a.sql.tmp_exchange" ]; then echo "the temporary file is left"; fi

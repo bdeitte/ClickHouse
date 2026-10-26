@@ -3,6 +3,8 @@
 # `mount -t nfs4 -o vers=4.2,addr=<IP of nfs1> <IP of nfs1>:/ <directory>`, which also works without `mount.nfs`.
 services:
   nfs1:
+    # The image has a single maintainer. `mirror-images.sh` mirrors it as `clickhouse/hectorm-nfs-ganesha:v11`:
+    # switch to that name once the mirror is pushed.
     image: hectorm/nfs-ganesha:v11
     restart: "no"
     read_only: true
