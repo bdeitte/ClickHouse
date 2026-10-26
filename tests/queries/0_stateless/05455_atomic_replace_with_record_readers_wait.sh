@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Tags: no-parallel
+# Tags: no-parallel, no-fasttest
 # Tag no-parallel: the failpoints are server-wide and would change the swaps of other tests.
+# Tag no-fasttest: a test that runs alone is kept out of the fast test.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -52,14 +53,21 @@ $CLICKHOUSE_CLIENT -q "
 "
 set_metadata_dir "$DB" DIR
 
-# Swaps never use a record when the server setting turns the emulation off, or when the metadata of the database
-# is not on the local filesystem (for example, a `database_disk` on object storage). The swap would then never
-# pause, and `SYSTEM WAIT FAILPOINT` below would wait forever. The directory of a database exists once it has a table.
-EMULATION=$($CLICKHOUSE_CLIENT -q "SELECT value FROM system.server_settings WHERE name = 'database_atomic_allow_exchange_emulation'")
-if [ "$EMULATION" != "1" ] || [ ! -d "$DIR" ]
+# Swaps never use a record when the metadata of the database is not on the local filesystem (for example, a `database_disk`
+# on object storage). The swap would then never pause, and `SYSTEM WAIT FAILPOINT` below would wait forever.
+# The directory of a database exists once it has a table.
+if [ ! -d "$DIR" ]
 then
     cat "${BASH_SOURCE[0]%.sh}.reference"
     exit 0
+fi
+
+# `tests/config/install.sh` turns the emulation on for every server that runs this test.
+EMULATION=$($CLICKHOUSE_CLIENT -q "SELECT value FROM system.server_settings WHERE name = 'database_atomic_allow_exchange_emulation'")
+if [ "$EMULATION" != "1" ]
+then
+    echo "The server setting database_atomic_allow_exchange_emulation is '$EMULATION', not 1" >&2
+    exit 1
 fi
 
 # The reader finds the table and stops before it reads the metadata file. Only a query whose id starts with
@@ -78,9 +86,11 @@ $CLICKHOUSE_CLIENT -q "SYSTEM ENABLE FAILPOINT $READER_FAILPOINT"
 reader_pid=$!
 $CLICKHOUSE_CLIENT -q "SYSTEM WAIT FAILPOINT $READER_FAILPOINT PAUSE"
 
-# The swap stops after its second move, while `t.sql` is missing.
+# The swap stops after its second move, while `t.sql` is missing. Only a query whose id starts with
+# `atomic_exchange_pause_after_second_move_` stops there, so that no other swap takes the pause.
 $CLICKHOUSE_CLIENT -q "SYSTEM ENABLE FAILPOINT $SWAP_FAILPOINT"
-$CLICKHOUSE_CLIENT -q "REPLACE TABLE $DB.t (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x" &
+$CLICKHOUSE_CLIENT --query_id "atomic_exchange_pause_after_second_move_${CLICKHOUSE_DATABASE}_$RANDOM$RANDOM" \
+    -q "REPLACE TABLE $DB.t (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x" &
 swap_pid=$!
 $CLICKHOUSE_CLIENT -q "SYSTEM WAIT FAILPOINT $SWAP_FAILPOINT PAUSE"
 if [ -f "$DIR/t.sql" ]

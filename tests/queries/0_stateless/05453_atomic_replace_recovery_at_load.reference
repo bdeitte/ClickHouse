@@ -25,10 +25,14 @@ b rows: 1
 case 5: a leftover temporary record and a leftover write of a finish
 a: x
 b: x,y
+a rows: 1
+b rows: 2,3
 
 case 6: the record only, and a metadata file that changed after it
 a: x,z
 b: x,y
+a rows: 1,0
+b rows: 2,3
 
 case 7: the temporary file, and a metadata file with neither of the recorded contents
 CORRUPTED_DATA
@@ -38,6 +42,8 @@ a.sql is untouched
 b.sql is untouched
 a: x
 b: x,y
+a rows: 1
+b rows: 2,3
 
 case 8: a temporary file with neither of the recorded contents, after the first move
 CORRUPTED_DATA
@@ -47,6 +53,8 @@ b.sql is untouched
 a.sql is missing
 a: x
 b: x,y
+a rows: 1
+b rows: 2,3
 
 case 9: the temporary file without a record
 no valid exchange record is next to it
@@ -61,3 +69,5 @@ a.sql is untouched
 b.sql is untouched
 a: x
 b: x,y
+a rows: 1
+b rows: 2,3

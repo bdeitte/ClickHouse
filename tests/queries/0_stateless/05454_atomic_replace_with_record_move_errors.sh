@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Tags: no-parallel
+# Tags: no-parallel, no-fasttest
 # Tag no-parallel: the failpoints are server-wide and would change the swaps of other tests.
+# Tag no-fasttest: a test that runs alone is kept out of the fast test.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -60,14 +61,20 @@ $CLICKHOUSE_CLIENT -q "
 "
 set_metadata_dir "$DB" DIR
 
-# Swaps never use a record when the server setting turns the emulation off, or when the metadata of the database
-# is not on the local filesystem (for example, a `database_disk` on object storage). The directory of a database exists
-# once it has a table.
-EMULATION=$($CLICKHOUSE_CLIENT -q "SELECT value FROM system.server_settings WHERE name = 'database_atomic_allow_exchange_emulation'")
-if [ "$EMULATION" != "1" ] || [ ! -d "$DIR" ]
+# Swaps never use a record when the metadata of the database is not on the local filesystem (for example, a `database_disk`
+# on object storage). The directory of a database exists once it has a table.
+if [ ! -d "$DIR" ]
 then
     cat "${BASH_SOURCE[0]%.sh}.reference"
     exit 0
+fi
+
+# `tests/config/install.sh` turns the emulation on for every server that runs this test.
+EMULATION=$($CLICKHOUSE_CLIENT -q "SELECT value FROM system.server_settings WHERE name = 'database_atomic_allow_exchange_emulation'")
+if [ "$EMULATION" != "1" ]
+then
+    echo "The server setting database_atomic_allow_exchange_emulation is '$EMULATION', not 1" >&2
+    exit 1
 fi
 
 function now_us()
@@ -105,12 +112,13 @@ function print_leftovers()
     $CLICKHOUSE_CLIENT -q "SELECT 'temporary tables: ' || toString(count()) FROM system.tables WHERE database = '$DB' AND name LIKE '_tmp_replace_%'"
 }
 
-# Prints whether the database logged a message like $1 since the time $2.
+# Prints how many times the database logged a message like $1 since the time $2. A swap logs each of these warnings once,
+# so the count also shows that a swap retried only once.
 function print_warning()
 {
     $CLICKHOUSE_CLIENT -q "SYSTEM FLUSH LOGS text_log"
     $CLICKHOUSE_CLIENT -q "
-        SELECT if(count() > 0, 'logged: ', 'not logged: ') || '$1'
+        SELECT 'warnings logged: ' || toString(count()) || ', ' || '$1'
         FROM system.text_log
         WHERE event_date >= yesterday() AND toUnixTimestamp64Micro(event_time_microseconds) >= $2
             AND endsWith(logger_name, '($DB)') AND level = 'Warning' AND message LIKE '$1'"
@@ -163,5 +171,6 @@ print_columns
 print_file_has_y
 print_leftovers
 print_warning "$RETRYING" "$since"
-# No fence was raised.
-$CLIENT -q "CREATE TABLE $DB.c (x UInt8) ENGINE = Memory" && echo "created c"
+# No fence was set: DDL on `t` works, and there is no warning about a swap that could not be finished.
+$CLIENT -q "ALTER TABLE $DB.t MODIFY COMMENT 'not fenced'" && echo "altered t"
+$CLICKHOUSE_CLIENT -q "SELECT 'fence warnings: ' || toString(count()) FROM system.warnings WHERE message LIKE '%$DB%could not be finished%'"

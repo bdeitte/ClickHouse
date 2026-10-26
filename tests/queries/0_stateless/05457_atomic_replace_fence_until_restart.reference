@@ -1,0 +1,31 @@
+the start that fences
+warnings: 1
+the error of the fence says what the restart does: 1
+unreadable definitions: 2
+the error of the refresh says what the restart does: 1
+refreshing views: 1
+errors without an expected code: 1
+the error of the swap is FAULT_INJECTED: 1
+the error of the swap says what the restart does: 1
+dot-files: 2
+temporary files: 2
+
+the start that finishes the swaps, with the setting off
+warnings: 0
+t: x,y
+t rows: 2,3
+replaced table rows: 1,5
+replaced table rows after TRUNCATE: 0
+mv rows: 7
+leftover .tmp table rows: 0
+inner tables: 0
+dot-files: 0
+temporary files: 0
+
+a start with the setting off, where a swap is not emulated
+the error mentions the setting: 1
+the error says the swap is not emulated: 0
+v: x
+temporary tables: 0
+dot-files: 0
+temporary files: 0

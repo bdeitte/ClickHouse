@@ -226,9 +226,20 @@ void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & met
         }
 
         /// Without the temporary file, the moves either did not begin or all finished, and the record only has to be removed.
-        /// The files are not compared with the record here: they can legitimately hold neither recorded state,
-        /// for example after an `ALTER` that followed an exchange whose record was not removed.
-        if (disk->existsFile(metadataExchangeTmpPath(record->old_path)))
+        /// The files can legitimately hold neither recorded state, for example after an `ALTER` that followed an exchange
+        /// whose record was not removed, so the load does not fail then. But after an exchange that failed and was fenced
+        /// without the state of its files being known, the record is the only copy of the two definitions, so it is logged
+        /// before it is removed.
+        if (!disk->existsFile(metadataExchangeTmpPath(record->old_path)))
+        {
+            if (inspectMetadataExchange(disk, *record) == MetadataExchangeState::Inconsistent)
+                LOG_WARNING(
+                    log, "The files {} and {} hold neither the contents from before nor from after the exchange recorded in {}. "
+                    "Removing the record, which recorded this content for {} after the exchange:\n{}\nand this content for {}:\n{}",
+                    record->old_path, record->new_path, record_path,
+                    record->old_path, record->old_path_content, record->new_path, record->new_path_content);
+        }
+        else
         {
             if (inspectMetadataExchange(disk, *record) != MetadataExchangeState::Interrupted)
                 throw Exception(

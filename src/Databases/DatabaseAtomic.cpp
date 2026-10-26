@@ -25,6 +25,7 @@
 #include <Common/AsyncLoader.h>
 #include <Common/CurrentThread.h>
 #include <Common/FailPoint.h>
+#include <Common/LockMemoryExceptionInThread.h>
 #include <Interpreters/ProcessList.h>
 
 
@@ -88,6 +89,10 @@ namespace
 /// Only a query whose id starts with the prefix pauses at `database_atomic_pause_before_reading_create_query`,
 /// so that the readers of other queries and of background threads do not take the pause meant for a test.
 constexpr std::string_view pause_before_reading_create_query_query_id_prefix = "atomic_pause_before_reading_create_query_";
+
+/// Only a query whose id starts with the prefix pauses at `database_atomic_exchange_pause_after_second_move`,
+/// so that the swaps of other queries and of refreshes do not take the pause meant for a test.
+constexpr std::string_view pause_after_second_move_query_id_prefix = "atomic_exchange_pause_after_second_move_";
 
 }
 
@@ -754,7 +759,8 @@ std::vector<std::pair<ASTPtr, StoragePtr>> DatabaseAtomic::getTablesForBackup(co
 void DatabaseAtomic::checkNoUnfinishedExchange(const String & table_name) const
 {
     /// The caller holds the DDL guard of `table_name`, see `has_unfinished_exchange`, or accepts missing a fence set at the
-    /// same moment, see `StorageMaterializedView::checkTableCanBeDropped`. With an empty name, the caller holds
+    /// same moment, see `StorageMaterializedView::checkTableCanBeDropped`. `DatabaseOverlay::getCreateTableQueryImpl` calls
+    /// it after a read of the definition that the fence refused in the same thread. With an empty name, the caller holds
     /// no lock that an exchange takes, so the check locks `mutex` and waits for an exchange that holds it.
     if (!table_name.empty() && !has_unfinished_exchange.load(std::memory_order_relaxed))
         return;
@@ -871,8 +877,11 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
             disk->moveFile(record.new_path, record.old_path);
             fiu_do_on(FailPoints::database_atomic_exchange_fail_after_second_move,
                 { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the second move of an exchange"); });
-            /// Lets a test hold the swap while a file is missing, to check that readers wait for the moves.
-            FailPointInjection::pauseFailPoint(FailPoints::database_atomic_exchange_pause_after_second_move);
+            /// Lets a test hold the swap while a file is missing, to check that readers wait for the moves. The query id is
+            /// checked second, so that it is not read in builds without failpoints.
+            if (FailPointInjection::hasAnyFailPointBeenRegistered()
+                && CurrentThread::getQueryId().starts_with(pause_after_second_move_query_id_prefix))
+                FailPointInjection::pauseFailPoint(FailPoints::database_atomic_exchange_pause_after_second_move);
             disk->moveFile(tmp_path, record.new_path);
             fiu_do_on(FailPoints::database_atomic_exchange_fail_after_third_move,
                 { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the third move of an exchange"); });
@@ -951,6 +960,10 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
 
     if (outcome == Outcome::Fence)
     {
+        /// The fence must be set even when the query is over its memory limit. Otherwise an allocation for the hint or for
+        /// `unfinished_exchanges` could throw before both names are fenced, and DDL could change the half-exchanged files.
+        LockMemoryExceptionInThread lock_memory_tracker(VariableContext::Global);
+
         /// The record stays for the next load, and until then DDL on the two tables fails. The next load finishes the exchange
         /// when the temporary file is left. Without it, the load only removes the record and leaves the files as they are.
         /// The hint tells the user which of these the restart does.
@@ -1512,6 +1525,18 @@ explicitly in that case:
 ATTACH DATABASE db UUID '28f1c61c-2970-457a-bffe-454156ddcfef'
 SETTINGS disk = disk(type = 'local', path = '/var/lib/clickhouse-disks/db_disk');
 ```
+
+### Metadata on NFS {#metadata-on-nfs}
+
+`EXCHANGE TABLES`, `EXCHANGE DICTIONARIES`, `CREATE OR REPLACE`, `REPLACE TABLE` and the refreshes of refreshable materialized views
+that are not `APPEND` swap the metadata files of two tables with the system call `renameat2(RENAME_EXCHANGE)`. NFS, including
+Amazon EFS, does not support that call, so these statements fail with `UNSUPPORTED_METHOD` when the metadata of the database is on NFS.
+
+With the experimental server setting [`database_atomic_allow_exchange_emulation`](/reference/settings/server-settings/settings/other#database_atomic_allow_exchange_emulation),
+`CREATE OR REPLACE`, `REPLACE TABLE` and refreshes work on NFS when the metadata is on a `local` disk. The swap first writes a record
+of both files, then moves the files one at a time, so the next load of the database finishes a swap that a crash interrupted.
+`EXCHANGE TABLES`, `EXCHANGE DICTIONARIES`, exchanges between two databases and `Replicated` databases still fail on NFS.
+The description of the setting explains what happens when a swap fails and cannot be finished.
 
 ### Limiting the number of tables {#limiting-the-number-of-tables}
 

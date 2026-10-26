@@ -24,6 +24,8 @@ $CLICKHOUSE_LOCAL -q "
     CREATE OR REPLACE TABLE t (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x; -- { serverError FAULT_INJECTED }
     SELECT 'warnings: ' || toString(count()) FROM system.warnings WHERE message LIKE '%could not be finished%';
     CREATE TABLE IF NOT EXISTS t (x UInt8) ENGINE = MergeTree ORDER BY x; -- { serverError UNFINISHED_METADATA_EXCHANGE }
+    -- The overlay reports the refused read of the definition, not a missing table.
+    SHOW CREATE TABLE t; -- { serverError UNFINISHED_METADATA_EXCHANGE }
     DROP DATABASE default; -- { serverError UNFINISHED_METADATA_EXCHANGE }
     OPTIMIZE TABLE u FINAL;
     SELECT 'u is not shut down';

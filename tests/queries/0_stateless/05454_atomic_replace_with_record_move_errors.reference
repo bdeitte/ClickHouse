@@ -4,28 +4,28 @@ on disk has y: yes
 dot-files: 0
 other files: 0
 temporary tables: 0
-logged: Finished the exchange of % and % after an error: %FAULT_INJECTED%
+warnings logged: 1, Finished the exchange of % and % after an error: %FAULT_INJECTED%
 database_atomic_exchange_fail_after_second_move
 t columns: x
 on disk has y: no
 dot-files: 0
 other files: 0
 temporary tables: 0
-logged: Finished the exchange of % and % after an error: %FAULT_INJECTED%
+warnings logged: 1, Finished the exchange of % and % after an error: %FAULT_INJECTED%
 database_atomic_exchange_fail_after_third_move
 t columns: x, y
 on disk has y: yes
 dot-files: 0
 other files: 0
 temporary tables: 0
-logged: The exchange of % and % completed despite an error: %FAULT_INJECTED%
+warnings logged: 1, The exchange of % and % completed despite an error: %FAULT_INJECTED%
 database_atomic_exchange_fail_before_first_move
 t columns: x
 on disk has y: no
 dot-files: 0
 other files: 0
 temporary tables: 0
-logged: Retrying the exchange of % and % after an error: %FAULT_INJECTED%
+warnings logged: 1, Retrying the exchange of % and % after an error: %FAULT_INJECTED%
 database_atomic_exchange_always_fail_before_first_move
 FAULT_INJECTED
 t columns: x
@@ -33,5 +33,6 @@ on disk has y: no
 dot-files: 0
 other files: 0
 temporary tables: 0
-logged: Retrying the exchange of % and % after an error: %FAULT_INJECTED%
-created c
+warnings logged: 1, Retrying the exchange of % and % after an error: %FAULT_INJECTED%
+altered t
+fence warnings: 0

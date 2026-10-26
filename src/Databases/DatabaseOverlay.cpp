@@ -243,12 +243,17 @@ ASTPtr DatabaseOverlay::getCreateTableQueryImpl(const String & name, ContextPtr 
             break;
     }
     if (!result && throw_on_error)
+    {
+        /// A member returns nothing for a table whose exchange of metadata files could not be finished,
+        /// so that error is reported instead of a missing table.
+        checkNoUnfinishedExchange(name);
         throw Exception(
             ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY,
             "There is no metadata of table `{}` in database `{}` (engine {})",
             name,
             getDatabaseName(),
             getEngineName());
+    }
     return result;
 }
 

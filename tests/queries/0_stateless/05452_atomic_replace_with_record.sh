@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Tags: no-parallel
+# Tags: no-parallel, no-fasttest
 # Tag no-parallel: the failpoints are server-wide and would change the swaps of other tests.
+# Tag no-fasttest: a test that runs alone is kept out of the fast test.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -49,14 +50,20 @@ $CLICKHOUSE_CLIENT -q "
 "
 set_metadata_dir "$DB" DIR
 
-# Swaps never use a record when the server setting turns the emulation off, or when the metadata of the database
-# is not on the local filesystem (for example, a `database_disk` on object storage). The directory of a database exists
-# once it has a table.
-EMULATION=$($CLICKHOUSE_CLIENT -q "SELECT value FROM system.server_settings WHERE name = 'database_atomic_allow_exchange_emulation'")
-if [ "$EMULATION" != "1" ] || [ ! -d "$DIR" ]
+# Swaps never use a record when the metadata of the database is not on the local filesystem (for example, a `database_disk`
+# on object storage). The directory of a database exists once it has a table.
+if [ ! -d "$DIR" ]
 then
     cat "${BASH_SOURCE[0]%.sh}.reference"
     exit 0
+fi
+
+# `tests/config/install.sh` turns the emulation on for every server that runs this test.
+EMULATION=$($CLICKHOUSE_CLIENT -q "SELECT value FROM system.server_settings WHERE name = 'database_atomic_allow_exchange_emulation'")
+if [ "$EMULATION" != "1" ]
+then
+    echo "The server setting database_atomic_allow_exchange_emulation is '$EMULATION', not 1" >&2
+    exit 1
 fi
 
 function now_us()
