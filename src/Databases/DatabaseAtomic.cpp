@@ -48,10 +48,17 @@ namespace FailPoints
 {
     extern const char rename_database_after_dependency_check[];
     extern const char database_atomic_exchange_not_supported[];
+    extern const char database_atomic_exchange_fail_before_first_move[];
+    extern const char database_atomic_exchange_fail_after_first_move[];
+    extern const char database_atomic_exchange_fail_after_second_move[];
+    extern const char database_atomic_exchange_fail_after_third_move[];
+    extern const char database_atomic_exchange_always_fail_before_first_move[];
+    extern const char database_atomic_exchange_fail_to_finish[];
 }
 
 namespace ErrorCodes
 {
+    extern const int FAULT_INJECTED;
     extern const int UNKNOWN_TABLE;
     extern const int UNKNOWN_DATABASE;
     extern const int TABLE_ALREADY_EXISTS;
@@ -667,18 +674,113 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
     const DiskPtr & disk,
     const MetadataExchangeRecord & record,
     const String & record_path,
-    bool /* fsync */)
+    bool fsync)
 {
     LOG_DEBUG(log, "Exchanging {} and {} with an exchange record", record.old_path, record.new_path);
 
     /// The temporary file exists only between the first and the last move, so it shows that an exchange is in progress.
     const String tmp_path = metadataExchangeTmpPath(record.old_path);
-    disk->moveFile(record.old_path, tmp_path);
-    disk->moveFile(record.new_path, record.old_path);
-    disk->moveFile(tmp_path, record.new_path);
+    auto try_move_files = [&]() -> std::exception_ptr
+    {
+        try
+        {
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_before_first_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault before the first move of an exchange"); });
+            fiu_do_on(FailPoints::database_atomic_exchange_always_fail_before_first_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault before the first move of an exchange"); });
+            disk->moveFile(record.old_path, tmp_path);
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_after_first_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the first move of an exchange"); });
+            disk->moveFile(record.new_path, record.old_path);
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_after_second_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the second move of an exchange"); });
+            disk->moveFile(tmp_path, record.new_path);
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_after_third_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the third move of an exchange"); });
+            return nullptr;
+        }
+        catch (...)
+        {
+            /// Handled below by the state of the files.
+            return std::current_exception();
+        }
+    };
+
+    enum class Outcome : uint8_t
+    {
+        Done,
+        Retry,
+        FailCleanly,
+        Fence,
+    };
+
+    /// A move can also report an error after it succeeded, so the state of the files decides, not the error.
+    std::exception_ptr error;
+    /// Built here, so that the `catch` of the `noexcept` lambda below does not allocate.
+    const String finish_error_prefix = fmt::format("Cannot finish the exchange of {} and {}", record.old_path, record.new_path);
+    auto handle_error = [&](bool retried) noexcept -> Outcome
+    {
+        try
+        {
+            switch (inspectMetadataExchange(disk, record))
+            {
+                case MetadataExchangeState::Interrupted:
+                    fiu_do_on(FailPoints::database_atomic_exchange_fail_to_finish,
+                        { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault before finishing an exchange"); });
+                    finishMetadataExchange(disk, record, fsync);
+                    LOG_WARNING(log, "Finished the exchange of {} and {} after an error: {}",
+                        record.old_path, record.new_path, getExceptionMessage(error, false));
+                    return Outcome::Done;
+                case MetadataExchangeState::AfterExchange:
+                    LOG_WARNING(log, "The exchange of {} and {} completed despite an error: {}",
+                        record.old_path, record.new_path, getExceptionMessage(error, false));
+                    return Outcome::Done;
+                case MetadataExchangeState::BeforeExchange:
+                    if (!retried)
+                        return Outcome::Retry;
+                    /// Nothing has changed, so the query can fail.
+                    return Outcome::FailCleanly;
+                case MetadataExchangeState::Inconsistent:
+                    return Outcome::Fence;
+            }
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, finish_error_prefix);
+        }
+        return Outcome::Fence;
+    };
+
+    error = try_move_files();
+    Outcome outcome = error ? handle_error(/* retried */ false) : Outcome::Done;
+    if (outcome == Outcome::Retry)
+    {
+        /// Not the writes of the roll forward: without the temporary file, a crash between them would leave two files with the same UUID.
+        LOG_WARNING(log, "Retrying the exchange of {} and {} after an error: {}",
+            record.old_path, record.new_path, getExceptionMessage(error, false));
+        if (auto retry_error = try_move_files())
+        {
+            error = retry_error;
+            outcome = handle_error(/* retried */ true);
+        }
+        else
+        {
+            outcome = Outcome::Done;
+        }
+    }
+
+    if (outcome == Outcome::Fence)
+    {
+        /// The record and the temporary file stay for the next load. The fence of the two tables is not here yet.
+        LOG_ERROR(log, "Cannot resolve the failed exchange of {} and {}, the record {} and the temporary file {} stay: {}",
+            record.old_path, record.new_path, record_path, tmp_path, getExceptionMessage(error, false));
+        std::rethrow_exception(error);
+    }
 
     /// Without the temporary file, the record is harmless, and the next load removes it.
     tryRemoveMetadataExchangeFiles(disk, {record_path}, log, /* found_at_load */ false);
+    if (outcome == Outcome::FailCleanly)
+        std::rethrow_exception(error);
 }
 
 LoadTaskPtr DatabaseAtomic::startupDatabaseAsync(AsyncLoader & async_loader, LoadJobSet startup_after, LoadingStrictnessLevel mode)
