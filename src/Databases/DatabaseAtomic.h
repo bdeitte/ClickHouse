@@ -163,6 +163,18 @@ private:
         bool fsync,
         bool has_keeper_transaction) TSA_NO_THREAD_SAFETY_ANALYSIS;
 
+    /// Fences an exchange that failed and could not be finished: sets `unfinished_exchanges` for `table_name` in this database
+    /// and `other_table_name` in `other_db`, and `unfinished_exchange_in_database` in `Replicated`, then rethrows `error`.
+    /// `hint` tells what the restart does about the metadata files `files`. This function adds what the fence refuses
+    /// until then, and adds the result to `error`. The caller holds `mutex` of both databases.
+    [[noreturn]] void fenceUnfinishedExchange(
+        DatabaseAtomic & other_db,
+        const String & table_name,
+        const String & other_table_name,
+        const String & files,
+        String hint,
+        std::exception_ptr error) TSA_NO_THREAD_SAFETY_ANALYSIS;
+
     /// Throws `UNFINISHED` while an exchange of the metadata file of `table_name` could not be finished.
     void assertTableHasNoUnfinishedExchangeUnlocked(const String & table_name) const TSA_REQUIRES(mutex);
     /// Called under `mutex` by the operations that change metadata files and the digest of `Replicated`, before they commit,
@@ -179,14 +191,15 @@ private:
         String hint;
     };
 
-    /// Set when an exchange failed and could not be finished, so the metadata files of its two tables may be half exchanged.
+    /// Set when an exchange failed and could not be finished, so the metadata files of its two tables may be half exchanged,
+    /// and in `Replicated` also when an atomic exchange failed after the Keeper commit, so the files are behind Keeper.
     /// DDL on the two tables fails until a restart. The next load finishes an interrupted exchange from its record,
     /// or reports `CORRUPTED_DATA` when it cannot. In `Replicated`, the replica recovery from Keeper repairs files that are behind Keeper.
     /// `DROP`, `DETACH` and `TRUNCATE DATABASE` fail too. By table name.
     std::map<String, UnfinishedExchange> unfinished_exchanges TSA_GUARDED_BY(mutex);
     /// Set in `Replicated` with `unfinished_exchanges`, so that DDL on every table of the database, and every other query
     /// that the database replicates through its log, such as a mutation or `TRUNCATE`, fails until a restart: the digest of
-    /// the database reads every metadata file, so it does not match while two of them are half exchanged. A query that is
+    /// the database reads every metadata file, so it does not match Keeper while two of them are not fully exchanged. A query that is
     /// not replicated through the log, such as a mutation of `ReplicatedMergeTree` in a database with one shard, is not refused.
     /// A change of metadata that commits after the fence is refused too, see `assertCanCommitMetadataChangeUnlocked`: after a failed
     /// exchange, `tables_metadata_digest` still holds the digest before the exchange while Keeper holds the one after it, so the

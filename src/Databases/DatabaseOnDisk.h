@@ -133,10 +133,11 @@ protected:
         bool throw_on_error) const override;
 
     virtual ASTPtr getCreateQueryFromMetadata(const String & table_name, bool throw_on_error) const;
-    /// Reads and parses the metadata file of `table_name` for `getCreateQueryFromMetadata`. An override must not take `mutex`.
+    /// Reads and parses the metadata file of `table_name` for `getCreateQueryFromMetadata`. Callers do not hold `mutex`, so an override
+    /// may take it, but not while it holds a lock that an exchange takes after `mutex`, such as `DatabaseAtomic::metadata_files_mutex`.
     virtual ASTPtr readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const;
     /// Reads the metadata file of `object_name` for `alterTable` and for the digest of `DatabaseReplicated`.
-    /// An override must not take `mutex`.
+    /// The digest is computed with `mutex` held, so an override must not take `mutex`.
     virtual String readObjectMetadataFile(const String & object_name) const;
     ASTPtr getCreateQueryFromStorage(const String & table_name, const StoragePtr & storage, bool throw_on_error) const;
 

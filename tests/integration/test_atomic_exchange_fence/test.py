@@ -7,9 +7,10 @@ from helpers.test_tools import assert_eq_with_retry
 
 # When an exchange of metadata files with a record fails after the Keeper commit and cannot be rolled
 # forward from the record, DDL on the two tables is fenced until a restart, and in a `Replicated` database
-# DDL on every table, because its digest reads every metadata file. This needs a restart to recover,
-# so a stateless test cannot cover it. The failpoint `database_atomic_exchange_with_record` forces the
-# record path, and other failpoints fail the moves of the exchange and the handling of the failure.
+# DDL on every table, because its digest reads every metadata file. A `Replicated` database is fenced the same
+# way when an atomic exchange fails after the Keeper commit. This needs a restart to recover, so a stateless test
+# cannot cover it. The failpoint `database_atomic_exchange_with_record` forces the record path, and other
+# failpoints fail the moves or the atomic exchange, and the handling of the failure.
 
 cluster = ClickHouseCluster(__file__)
 
@@ -23,8 +24,8 @@ node = cluster.add_instance(
     macros={"shard": "shard1", "replica": "replica1"},
 )
 # Holds a second replica of a `Replicated` database. A second replica on `node` cannot recreate the
-# tables of the database, because their UUIDs are already taken there.
-node2 = cluster.add_instance("node2", with_zookeeper=True)
+# tables of the database, because their UUIDs are already taken there. It runs with the emulation disabled, the default.
+node2 = cluster.add_instance("node2", with_zookeeper=True, stay_alive=True)
 
 
 @pytest.fixture(scope="module")
@@ -37,15 +38,15 @@ def started_cluster():
 
 
 @contextmanager
-def failpoints_enabled(failpoints):
+def failpoints_enabled(failpoints, instance=node):
     # The failpoints are server-wide, so a failed assertion must not leave them enabled for the next tests.
     try:
         for failpoint in failpoints:
-            node.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
+            instance.query(f"SYSTEM ENABLE FAILPOINT {failpoint}")
         yield
     finally:
         for failpoint in failpoints:
-            node.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
+            instance.query(f"SYSTEM DISABLE FAILPOINT {failpoint}")
 
 
 def metadata_files(database):
@@ -513,3 +514,51 @@ def test_fence_refuses_replica_recovery(started_cluster):
     node.query("DROP DATABASE IF EXISTS fence_dict_broken_replicated_tables SYNC")
     for name in ["1", "2"]:
         node.query(f"DROP TABLE default.fence_dict_src{name} SYNC")
+
+
+def test_fence_after_failed_atomic_exchange(started_cluster):
+    # Without the emulation, a `Replicated` database exchanges the metadata files with one atomic exchange after
+    # the Keeper commit. The failpoint fails that exchange, as a filesystem without an atomic exchange, such as NFS,
+    # does. Keeper then holds the exchange while the files do not, so the database is fenced until the restart,
+    # which recovers the replica from Keeper. Views keep no data, so the recovery recreates them from Keeper.
+    node2.query(
+        "CREATE DATABASE fence_plain"
+        " ENGINE = Replicated('/clickhouse/databases/fence_plain', 'shard1', 'replica1')"
+    )
+    for name, value in [("a", "1"), ("b", "2")]:
+        node2.query(
+            f"CREATE VIEW fence_plain.{name} AS SELECT {value} AS x",
+            settings={"distributed_ddl_output_mode": "none"},
+        )
+
+    with failpoints_enabled(["database_atomic_exchange_fail_rename_exchange"], node2):
+        error = node2.query_and_get_error(
+            "EXCHANGE TABLES fence_plain.a AND fence_plain.b",
+            settings={"distributed_ddl_output_mode": "none"},
+        )
+    assert "FAULT_INJECTED" in error
+    assert "failed after Keeper recorded it" in error
+    # The emulation is disabled on `node2`, so the error suggests it.
+    assert "database_atomic_allow_exchange_emulation" in error
+
+    # Without the fence, this `CREATE` would write a digest to Keeper that matches the files,
+    # and the restart would not recover the replica.
+    assert node2.query("SELECT x FROM fence_plain.a").strip() == "1"
+    assert "UNFINISHED" in node2.query_and_get_error(
+        "CREATE VIEW fence_plain.c AS SELECT 3 AS x",
+        settings={"distributed_ddl_output_mode": "none"},
+    )
+
+    node2.restart_clickhouse()
+
+    # The recovery after the restart recreates the views from Keeper, which holds the exchange.
+    assert_eq_with_retry(
+        node2, "SELECT x FROM fence_plain.a", "2", retry_count=60, ignore_error=True
+    )
+    # The fence is gone.
+    node2.query(
+        "CREATE VIEW fence_plain.c AS SELECT 3 AS x",
+        settings={"distributed_ddl_output_mode": "none"},
+    )
+    node2.query("DROP DATABASE fence_plain SYNC")
+    node2.query("DROP DATABASE IF EXISTS fence_plain_broken_tables SYNC")

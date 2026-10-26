@@ -55,6 +55,7 @@ namespace FailPoints
     extern const char database_atomic_exchange_fail_after_first_move[];
     extern const char database_atomic_exchange_fail_after_second_move[];
     extern const char database_atomic_exchange_fail_after_third_move[];
+    extern const char database_atomic_exchange_fail_rename_exchange[];
     extern const char database_atomic_exchange_always_fail_before_first_move[];
     extern const char database_atomic_exchange_fail_to_finish[];
     extern const char database_atomic_exchange_probe_not_supported[];
@@ -91,6 +92,17 @@ namespace
 /// Only a query whose id starts with the prefix pauses at `database_atomic_pause_before_reading_create_query`,
 /// so that the readers of other queries and of background threads do not take the pause meant for a test.
 constexpr std::string_view pause_before_reading_create_query_query_id_prefix = "atomic_pause_before_reading_create_query_";
+
+/// What the next start does when the metadata files of database `database_name` are behind Keeper, which holds an exchange.
+String recoveryFromKeeperHint(const String & database_name)
+{
+    return fmt::format(
+        "At the next start, the replica is recovered from Keeper if the database setting `check_consistency` is enabled, which is "
+        "the default: tables that support replication are renamed to match Keeper, and other tables are recreated empty from Keeper, "
+        "with the originals moved to the database {}, or dropped when the server setting `database_replicated_drop_broken_tables` "
+        "is enabled",
+        backQuote(database_name + DatabaseReplicated::BROKEN_TABLES_SUFFIX));
+}
 
 }
 
@@ -307,9 +319,9 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
     /// On a local disk, an exchange the filesystem cannot do atomically is done with a record, see `canExchangeAtomically`.
     /// Both databases must be on local disks, and the server setting can turn the emulation off:
     /// otherwise the exchange behaves as before the record existed.
-    const bool can_emulate_exchange = exchange
-        && local_context->getServerSettings()[ServerSetting::database_atomic_allow_exchange_emulation]
-        && canEmulateExchange(getDisk()) && canEmulateExchange(to_database.getDisk());
+    const bool disks_can_emulate_exchange = exchange && canEmulateExchange(getDisk()) && canEmulateExchange(to_database.getDisk());
+    const bool can_emulate_exchange
+        = disks_can_emulate_exchange && local_context->getServerSettings()[ServerSetting::database_atomic_allow_exchange_emulation];
     std::string message;
     if (exchange && !can_emulate_exchange && !supportsAtomicRename(&message))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "RENAME EXCHANGE is not supported because exchanging files is not supported by the OS ({})", message);
@@ -492,11 +504,38 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
     /// NOTE: replica will be lost if server crashes before the following rename
     /// TODO better detection and recovery
     if (use_record)
+    {
         exchangeMetadataFilesWithRecord(other_db, table_name, to_table_name, db_disk, record, record_paths, fsync, has_keeper_transaction);
+    }
     else if (exchange)
-        db_disk->renameExchange(old_metadata_path, new_metadata_path);
+    {
+        try
+        {
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_rename_exchange,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault instead of the atomic exchange"); });
+            db_disk->renameExchange(old_metadata_path, new_metadata_path);
+        }
+        catch (...)
+        {
+            /// Without Keeper, nothing has changed. With it, the files are behind Keeper, as after a failed exchange with a record,
+            /// so the fence keeps a change of metadata from hiding the exchange from the recovery at the next start,
+            /// see `unfinished_exchange_in_database`. This is what happens on a filesystem without an atomic exchange,
+            /// such as NFS, when the emulation is disabled: `supportsAtomicRename` checks only the OS.
+            if (!has_keeper_transaction)
+                throw;
+            String hint = "The atomic exchange of the metadata files failed after Keeper recorded it, so the files are behind Keeper. "
+                + recoveryFromKeeperHint(database_name);
+            if (disks_can_emulate_exchange && !can_emulate_exchange)
+                hint += ". Where the filesystem cannot exchange two files atomically, such as NFS, enable the server setting "
+                    "`database_atomic_allow_exchange_emulation` so that exchanges do not fail";
+            fenceUnfinishedExchange(other_db, table_name, to_table_name,
+                fmt::format("{} and {}", old_metadata_path, new_metadata_path), std::move(hint), std::current_exception());
+        }
+    }
     else
+    {
         db_disk->moveFile(old_metadata_path, new_metadata_path);
+    }
 
     /// After metadata was successfully moved, the following methods should not throw (if they do, it's a logical error)
     table_data_path = detach(*this, table_name, table->storesDataOnDisk());
@@ -1008,73 +1047,84 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
                     tmp_path, record_path);
             if (has_keeper_transaction)
                 hint += fmt::format(
-                    "the next load removes the record {} and leaves the files as they are, behind Keeper, which already holds the exchange. "
-                    "The replica is then recovered from Keeper if the database setting `check_consistency` is enabled, which is the default: "
-                    "tables that support replication are renamed to match Keeper, and other tables are recreated empty from Keeper, "
-                    "with the originals moved to the database {}, or dropped when the server setting "
-                    "`database_replicated_drop_broken_tables` is enabled",
-                    record_path, backQuote(database_name + DatabaseReplicated::BROKEN_TABLES_SUFFIX));
+                    "the next load removes the record {} and leaves the files as they are, behind Keeper, which already holds the exchange. {}",
+                    record_path, recoveryFromKeeperHint(database_name));
             else
                 hint += fmt::format(
                     "the next load removes the record {} and leaves the two files as they are, "
                     "so compare them with the contents in the record before the restart",
                     record_path);
         }
-        /// The databases of an exchange have the same engine. In `Replicated`, the digest reads every metadata file,
-        /// so the fence covers every table of the database, see `unfinished_exchange_in_database`.
-        const bool fence_database = dynamic_cast<const DatabaseReplicated *>(this) != nullptr;
-        /// The fence also refuses the cleanup `DROP` of the temporary table, and the `ALTER` entries that the tables replicate.
-        hint += ". If the exchange was done by `CREATE OR REPLACE`, `REPLACE TABLE` or a refresh of a materialized view, "
-            "its temporary table could not be dropped: after the restart, drop it if it is still there. ";
-        if (fence_database)
-            hint += "Until the restart, `ReplicatedMergeTree` tables in the database cannot apply `ALTER` entries from other replicas, "
-                "and the entries queued after them wait. This replica of the `Replicated` database also stops applying "
-                "the database log once another replica writes to it, so queries on this replica that go through the log fail";
-        else
-            hint += "Until the restart, a `ReplicatedMergeTree` table among the two cannot apply `ALTER` entries from other replicas, "
-                "and the entries queued after them wait";
-        /// `DDLWorker` retries `UNFINISHED`, so that the server applies the query after the restart, as the other servers did.
-        hint += ". An `ON CLUSTER` query refused for this reason stays in the distributed DDL queue of this server and is retried "
-            "until the restart, and the `ON CLUSTER` queries queued after it wait. A query that one replica of each shard runs "
-            "for the shard, such as `ALTER` of a `ReplicatedMergeTree` table, is run by another replica instead, or fails after 3 tries";
-
-        const UnfinishedExchange unfinished{fmt::format("{} and {}", record.old_path, record.new_path), hint};
-        unfinished_exchanges[table_name] = unfinished;
-        other_db.unfinished_exchanges[other_table_name] = unfinished;
-        if (fence_database)
-        {
-            unfinished_exchange_in_database = unfinished;
-            other_db.unfinished_exchange_in_database = unfinished;
-        }
-        LOG_ERROR(log, "Cannot finish the exchange of {}, DDL on {} and reads of the definitions of the two tables fail "
-            "until the server restarts. {}",
-            unfinished.files, fence_database ? "the databases of both files" : "the two tables", hint);
-
-        try
-        {
-            std::rethrow_exception(error);
-        }
-        catch (Exception & e)
-        {
-            e.addMessage(hint);
-            throw;
-        }
-        catch (...)
-        {
-            /// A failed move on a local disk usually arrives as `std::filesystem::filesystem_error`, which cannot carry the hint.
-            /// The new exception keeps its code and message. The version is left out, because the final report adds it.
-            auto e = Exception::createRuntime(
-                getCurrentExceptionCode(),
-                getCurrentExceptionMessage(
-                    /* with_stacktrace */ false, /* check_embedded_stacktrace */ false, /* with_extra_info */ true, /* with_version */ false));
-            e.addMessage(hint);
-            throw e;
-        }
+        fenceUnfinishedExchange(other_db, table_name, other_table_name,
+            fmt::format("{} and {}", record.old_path, record.new_path), std::move(hint), error);
     }
 
     tryRemoveMetadataExchangeRecords(disk, record_paths, log, /* found_at_load */ false);
     if (outcome == Outcome::FailCleanly)
         std::rethrow_exception(error);
+}
+
+void DatabaseAtomic::fenceUnfinishedExchange(
+    DatabaseAtomic & other_db,
+    const String & table_name,
+    const String & other_table_name,
+    const String & files,
+    String hint,
+    std::exception_ptr error)
+{
+    /// The databases of an exchange have the same engine. In `Replicated`, the digest reads every metadata file,
+    /// so the fence covers every table of the database, see `unfinished_exchange_in_database`.
+    const bool fence_database = dynamic_cast<const DatabaseReplicated *>(this) != nullptr;
+    /// The fence also refuses the cleanup `DROP` of the temporary table, and the `ALTER` entries that the tables replicate.
+    hint += ". If the exchange was done by `CREATE OR REPLACE`, `REPLACE TABLE` or a refresh of a materialized view, "
+        "its temporary table could not be dropped: after the restart, drop it if it is still there. ";
+    if (fence_database)
+        hint += "Until the restart, `ReplicatedMergeTree` tables in the database cannot apply `ALTER` entries from other replicas, "
+            "and the entries queued after them wait. This replica of the `Replicated` database also stops applying "
+            "the database log once another replica writes to it, so queries on this replica that go through the log fail";
+    else
+        hint += "Until the restart, a `ReplicatedMergeTree` table among the two cannot apply `ALTER` entries from other replicas, "
+            "and the entries queued after them wait";
+    /// `DDLWorker` retries `UNFINISHED`, so that the server applies the query after the restart, as the other servers did.
+    hint += ". An `ON CLUSTER` query refused for this reason stays in the distributed DDL queue of this server and is retried "
+        "until the restart, and the `ON CLUSTER` queries queued after it wait. A query that one replica of each shard runs "
+        "for the shard, such as `ALTER` of a `ReplicatedMergeTree` table, is run by another replica instead, or fails after 3 tries";
+
+    const UnfinishedExchange unfinished{files, hint};
+    unfinished_exchanges[table_name] = unfinished;
+    other_db.unfinished_exchanges[other_table_name] = unfinished;
+    if (fence_database)
+    {
+        unfinished_exchange_in_database = unfinished;
+        other_db.unfinished_exchange_in_database = unfinished;
+    }
+    LOG_ERROR(log, "Cannot finish the exchange of {}, DDL on {} and reads of the definitions of the two tables fail "
+        "until the server restarts. {}",
+        unfinished.files, fence_database ? "the databases of both files" : "the two tables", hint);
+
+    try
+    {
+        std::rethrow_exception(error);
+    }
+    catch (Exception & e)
+    {
+        e.addMessage(hint);
+        throw;
+    }
+    catch (...)
+    {
+        /// A failed move on a local disk usually arrives as `std::filesystem::filesystem_error`, which cannot carry the hint.
+        /// The new exception keeps its code and message. The version is left out, because the final report adds it.
+        throw [&]
+        {
+            auto e = Exception::createRuntime(
+                getCurrentExceptionCode(),
+                getCurrentExceptionMessage(
+                    /* with_stacktrace */ false, /* check_embedded_stacktrace */ false, /* with_extra_info */ true, /* with_version */ false));
+            e.addMessage(hint);
+            return e;
+        }();
+    }
 }
 
 LoadTaskPtr DatabaseAtomic::startupDatabaseAsync(AsyncLoader & async_loader, LoadJobSet startup_after, LoadingStrictnessLevel mode)

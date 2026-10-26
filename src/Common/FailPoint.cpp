@@ -166,6 +166,7 @@ static struct InitFiu
     ONCE(database_atomic_exchange_fail_after_first_move) \
     ONCE(database_atomic_exchange_fail_after_second_move) \
     ONCE(database_atomic_exchange_fail_after_third_move) \
+    ONCE(database_atomic_exchange_fail_rename_exchange) \
     REGULAR(database_atomic_exchange_always_fail_before_first_move) \
     REGULAR(database_atomic_exchange_fail_to_finish) \
     REGULAR(database_atomic_exchange_probe_not_supported) \

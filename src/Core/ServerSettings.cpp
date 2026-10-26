@@ -545,7 +545,7 @@ The delay during which a dropped table can be restored using the [`UNDROP`](/ref
 The default for this setting is `480` (8 minutes).
 )", 0) \
     DECLARE(Bool, database_atomic_allow_exchange_emulation, false, R"(
-When enabled, on a local disk whose filesystem cannot exchange two files atomically (for example NFS), `Atomic` and `Replicated` databases emulate the exchange of two metadata files with three renames and a durable record, which keeps `EXCHANGE TABLES`, `EXCHANGE DICTIONARIES`, `REPLACE TABLE` and refreshes of refreshable materialized views crash-safe on such filesystems. When disabled, these statements fail on such filesystems with an error.
+When enabled, on a local disk whose filesystem cannot exchange two files atomically (for example NFS), `Atomic` and `Replicated` databases emulate the exchange of two metadata files with three renames and a durable record, which keeps `EXCHANGE TABLES`, `EXCHANGE DICTIONARIES`, `REPLACE TABLE` and refreshes of refreshable materialized views crash-safe on such filesystems. When disabled, these statements fail on such filesystems with an error. In a `Replicated` database, `EXCHANGE TABLES`, `EXCHANGE DICTIONARIES` and refreshes fail only after Keeper has recorded the exchange, so the database refuses DDL until the server restarts, and the restart recovers the replica from Keeper.
 
 The emulation also lets these statements run where the operating system has no atomic exchange of files at all, which they otherwise refuse.
 
