@@ -50,6 +50,8 @@
 #include <Common/setThreadName.h>
 #include <Common/ThreadPool.h>
 
+#include <fmt/ranges.h>
+
 
 namespace fs = std::filesystem;
 
@@ -800,13 +802,13 @@ void DatabaseOnDisk::iterateMetadataFiles(const IteratingFunction & process_meta
 
     /// The files of swaps of metadata files with a record that a crash interrupted, see `finishInterruptedMetadataExchangesAtLoad`.
     bool has_exchange_files = false;
-    String exchange_tmp_file_name;
+    Strings exchange_tmp_file_names;
 
     auto list_metadata_files = [&]
     {
         metadata_files.clear();
         has_exchange_files = false;
-        exchange_tmp_file_name.clear();
+        exchange_tmp_file_names.clear();
         for (const auto it = db_disk->iterateDirectory(metadata_path); it->isValid(); it->next())
         {
             auto sub_path = fs::path(it->path());
@@ -815,7 +817,7 @@ void DatabaseOnDisk::iterateMetadataFiles(const IteratingFunction & process_meta
             {
                 has_exchange_files = true;
                 if (!file_name.starts_with('.'))
-                    exchange_tmp_file_name = file_name;
+                    exchange_tmp_file_names.push_back(file_name);
                 continue;
             }
 
@@ -864,19 +866,20 @@ void DatabaseOnDisk::iterateMetadataFiles(const IteratingFunction & process_meta
     if (finished_exchanges)
         list_metadata_files();
 
-    if (!exchange_tmp_file_name.empty())
+    if (!exchange_tmp_file_names.empty())
     {
+        std::sort(exchange_tmp_file_names.begin(), exchange_tmp_file_names.end());
         if (finished_exchanges)
             throw Exception(ErrorCodes::INCORRECT_FILE_NAME,
-                "The temporary file {} of an exchange of metadata files that was not finished is left in metadata directory {}, "
-                "and no valid exchange record is next to it: the record is missing, or a warning in the log reports that it is not "
-                "an exchange record. To repair manually, restore the intended "
-                "content of the two files of the exchange, remove the temporary file, and load the database again",
-                exchange_tmp_file_name, getMetadataPath());
+                "Temporary files of exchanges of metadata files that were not finished are left in metadata directory {}: {}. "
+                "For each of them, no valid exchange record is next to it: the record is missing, or a warning in the log reports "
+                "that it is not an exchange record. To repair manually, restore the intended content of the two files of each "
+                "exchange, remove its temporary file, and load the database again",
+                getMetadataPath(), fmt::join(exchange_tmp_file_names, ", "));
         throw Exception(ErrorCodes::INCORRECT_FILE_NAME,
-            "The temporary file {} of an exchange of metadata files that was not finished is left in metadata directory {}. "
-            "A load finishes the exchange from its record only in an `Atomic` database on a local disk that is writable",
-            exchange_tmp_file_name, getMetadataPath());
+            "Temporary files of exchanges of metadata files that were not finished are left in metadata directory {}: {}. "
+            "A load finishes an exchange from its record only in an `Atomic` database on a local disk that is writable",
+            getMetadataPath(), fmt::join(exchange_tmp_file_names, ", "));
     }
 
     std::sort(metadata_files.begin(), metadata_files.end());

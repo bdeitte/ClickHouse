@@ -6,6 +6,9 @@
 #include <Storages/IStorage_fwd.h>
 #include <Common/SharedMutex.h>
 
+#include <atomic>
+#include <map>
+
 
 namespace DB
 {
@@ -77,6 +80,10 @@ public:
     /// Atomic database cannot be detached if there is detached table which still in use
     void assertCanBeDetached(bool cleanup) override;
 
+    /// Throws `UNFINISHED_METADATA_EXCHANGE` while an exchange of the metadata file of `table_name` could not be finished,
+    /// or, with an empty `table_name`, while this is so for any table of the database. See `unfinished_exchanges`.
+    void checkNoUnfinishedExchange(const String & table_name) const override;
+
     UUID tryGetTableUUID(const String & table_name) const override;
 
     void tryCreateSymlink(const StoragePtr & table, bool if_data_path_exist = false);
@@ -89,11 +96,15 @@ public:
     /// Waits for the moves of a swap with a record, see `metadata_files_mutex`.
     time_t getObjectMetadataModificationTime(const String & object_name) const override;
 
+    /// Refuses the tables of an unfinished exchange, see `unfinished_exchanges`, instead of leaving them out of the backup.
+    std::vector<std::pair<ASTPtr, StoragePtr>> getTablesForBackup(const FilterByNameFunction & filter, const ContextPtr & local_context) const override;
+
 protected:
     /// Finishes a swap that a crash interrupted, before `iterateMetadataFiles` processes any metadata file.
     bool finishInterruptedMetadataExchangesAtLoad() const override;
 
-    /// Waits for the moves of a swap with a record, see `metadata_files_mutex`.
+    /// Waits for the moves of a swap with a record, see `metadata_files_mutex`. Refuses the tables of an unfinished exchange,
+    /// or returns `nullptr` for them when `throw_on_error` is `false`.
     ASTPtr readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const override;
     /// Waits for the moves of a swap with a record, see `metadata_files_mutex`.
     String readObjectMetadataFile(const String & object_name) const override;
@@ -133,8 +144,9 @@ private:
     mutable SharedMutex metadata_files_mutex;
 
     /// Exchanges the two metadata files of `record` in this database with three moves, instead of an atomic exchange,
-    /// and then removes the record at `record_path` that `writeMetadataExchangeRecord` wrote.
-    /// The caller holds `mutex` and the DDL guards of `table_name` and `other_table_name`.
+    /// and then removes the record at `record_path` that `writeMetadataExchangeRecord` wrote. When a move fails and the
+    /// exchange can be neither retried nor finished from the record, it keeps the record and fences the two tables,
+    /// see `fenceUnfinishedExchange`. The caller holds `mutex` and the DDL guards of `table_name` and `other_table_name`.
     void exchangeMetadataFilesWithRecord(
         const String & table_name,
         const String & other_table_name,
@@ -142,6 +154,58 @@ private:
         const MetadataExchangeRecord & record,
         const String & record_path,
         bool fsync) TSA_REQUIRES(mutex);
+
+    /// Fences an exchange that failed and could not be finished: adds `table_name` and `other_table_name` to `unfinished_exchanges`,
+    /// then rethrows `error`. `hint` tells what the restart does about the metadata files `files`. This function adds what the fence
+    /// refuses until then and where the rows inserted until then end up, and adds the result to `error`.
+    [[noreturn]] void fenceUnfinishedExchange(
+        const String & table_name,
+        const String & other_table_name,
+        const String & files,
+        String hint,
+        std::exception_ptr error) TSA_REQUIRES(mutex);
+
+    /// Adds an entry to `system.warnings` about the fence that the exchange of `table_name` and `other_table_name` has just set,
+    /// so that it is seen by more than the query that hit it. Releases `lock` of `mutex` first. Does not throw, so that the caller
+    /// can rethrow the error of the exchange.
+    void warnAboutUnfinishedExchange(
+        std::unique_lock<std::mutex> & lock, const String & table_name, const String & other_table_name) const noexcept;
+
+    /// Throws `UNFINISHED_METADATA_EXCHANGE` while an exchange of the metadata file of `table_name` could not be finished.
+    void assertTableHasNoUnfinishedExchangeUnlocked(const String & table_name) const TSA_REQUIRES(mutex);
+
+    struct UnfinishedExchange
+    {
+        /// The two metadata files of the exchange.
+        String files;
+        /// What the restart does about the exchange and where the rows inserted until then end up, for the errors until then.
+        String hint;
+    };
+
+    /// Set when an exchange of two metadata files with a record failed and could not be finished, so the files of its two tables
+    /// may be half exchanged. By table name. Until the server restarts, DDL on the two tables and reads of their definitions fail,
+    /// and so do `DROP DATABASE` and `DETACH DATABASE`. When the temporary file of the exchange is left, the next load finishes the
+    /// exchange from its record, or reports `CORRUPTED_DATA` when the files hold none of the recorded contents. Without it, the load
+    /// removes the record and leaves the files as they are. Inserts are not refused: until the restart, they reach the tables as they
+    /// were before the exchange.
+    std::map<String, UnfinishedExchange> unfinished_exchanges TSA_GUARDED_BY(mutex);
+
+    /// Whether `unfinished_exchanges` is not empty. Set by `fenceUnfinishedExchange` and never cleared, like the fence. While it is
+    /// `false`, `readCreateQueryFromMetadataFile`, `getTablesForBackup` and `checkNoUnfinishedExchange` for a table do not lock
+    /// `mutex`, so that the readers of definitions and the DDL guards of a database without a fence do not contend on it.
+    /// The commit points still check under `mutex`.
+    ///
+    /// It is set while the exchange holds `mutex`, `metadata_files_mutex` exclusively and the DDL guards of both names. So a reader
+    /// that then takes `metadata_files_mutex` shared, or a DDL that then takes the guard of either name, sees it: the unlock by the
+    /// exchange is ordered before that lock, and the store before the unlock. A reader of a definition also takes `mutex` in
+    /// `tryGetTable` before its first check (`DatabaseOnDisk::getCreateTableQueryImpl`), so it sees a fence set before. A reader
+    /// whose first check runs while a failing exchange holds `mutex` can miss the fence there, and then fails on the missing file
+    /// or sees the fence in its second check. `getTablesForBackup` checks after its reads, and a read leaves a table out because
+    /// of the fence only after the same thread saw `true`. `checkNoUnfinishedExchange` for the whole database holds no lock that
+    /// the exchange takes, so it always locks `mutex`. The flag publishes nothing itself, because a check that sees `true` reads
+    /// `unfinished_exchanges` under `mutex`, and a load ordered after a store sees it whatever its memory order, so
+    /// `std::memory_order_relaxed` is enough.
+    std::atomic<bool> has_unfinished_exchange{false};
 };
 
 }

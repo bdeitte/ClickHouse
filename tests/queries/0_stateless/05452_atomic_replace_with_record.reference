@@ -1,15 +1,17 @@
 CREATE OR REPLACE TABLE
 t columns: x, y
 t rows: 1
+on disk has y: yes
 dot-files: 0
 other files: 0
-swapped with a record
+swaps with a record: 1
 REPLACE TABLE
 t columns: x
 t rows: 1
+on disk has y: no
 dot-files: 0
 other files: 0
-swapped with a record
+swaps with a record: 1
 REPLACE TABLE whose SELECT throws
 FUNCTION_THROW_IF_VALUE_IS_NON_ZERO
 t columns: x
@@ -17,19 +19,19 @@ t rows: 1
 temporary tables: 0
 dot-files: 0
 other files: 0
-swapped without a record
+swaps with a record: 0
 CREATE OR REPLACE TABLE with a name that needs escaping
 t.x y columns: x, y
 t.x y rows: 1
 dot-files: 0
 other files: 0
-swapped with a record
+swaps with a record: 1
 CREATE OR REPLACE TABLE of a table that does not exist
 n columns: x, y
 n rows: 1
 dot-files: 0
 other files: 0
-swapped without a record
+swaps with a record: 0
 concurrent CREATE OR REPLACE TABLE
 p columns: x, y
 p rows: 1
@@ -37,24 +39,24 @@ q columns: x, y
 q rows: 1
 dot-files: 0
 other files: 0
-swapped with a record
+swaps with a record: 2
 CREATE OR REPLACE VIEW
 new
 dot-files: 0
 other files: 0
-swapped with a record
+swaps with a record: 1
 CREATE OR REPLACE DICTIONARY
 1	old
 1	new
 dot-files: 0
 other files: 0
-swapped with a record
+swaps with a record: 1
 refreshable materialized view with an inner table
 1
 2
 dot-files: 0
 other files: 0
-swapped with a record
+swaps with a record: 1
 refreshable materialized view with a target table in another database
 1
 2
@@ -63,13 +65,14 @@ dot-files: 0
 other files: 0
 dot-files: 0
 other files: 0
-swapped with a record
+swaps with a record: 1
 EXCHANGE TABLES
 UNSUPPORTED_METHOD
+are not emulated
 a columns: x
 a rows: 0
 b columns: x, y
 b rows: 0
 dot-files: 0
 other files: 0
-swapped without a record
+swaps with a record: 0

@@ -921,6 +921,7 @@ public:
         SETTING_ZERO_COPY_REPLICATION_ENABLED,
         SKIPPING_CONDITION_QUERY,
         THREAD_FUZZER_IS_ENABLED,
+        UNFINISHED_METADATA_EXCHANGE,
     };
 
     std::unordered_map<WarningType, PreformattedMessage> getWarnings() const;

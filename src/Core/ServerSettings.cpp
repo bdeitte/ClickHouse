@@ -545,12 +545,18 @@ The delay during which a dropped table can be restored using the [`UNDROP`](/ref
 The default for this setting is `480` (8 minutes).
 )", 0) \
     DECLARE(Bool, database_atomic_allow_exchange_emulation, false, R"(
-When enabled, on a local disk whose filesystem cannot exchange two files atomically, such as NFS or EFS, `Atomic` databases emulate the exchange of two metadata files with three renames and a durable record. This keeps `CREATE OR REPLACE`, `REPLACE TABLE` and refreshes of refreshable materialized views working and crash-safe on such filesystems. It does not apply to `EXCHANGE TABLES`, `EXCHANGE DICTIONARIES` or `Replicated` databases, which still fail on such filesystems with an error.
+When enabled, on a local disk whose filesystem cannot exchange two files atomically, such as NFS or Amazon EFS, `Atomic` databases emulate the swap of two metadata files for `CREATE OR REPLACE`, `REPLACE TABLE` and refreshes of refreshable materialized views. The swap writes a durable record file `.<table>.sql.exchange`, then does three renames through a temporary file `<table>.sql.tmp_exchange`, so these statements work and stay crash-safe on such a filesystem.
 
-Exchanges that a crash interrupted are finished when the database loads, regardless of this setting.
+It does not cover `EXCHANGE TABLES`, `EXCHANGE DICTIONARIES`, exchanges between two databases, or `Replicated` databases. They still fail on such a filesystem.
 
-After a crash, start the server once more before a downgrade to a ClickHouse version before 26.11, so that it finishes the interrupted exchanges. Those versions refuse to load a database that has the temporary file `<table>.sql.tmp_exchange` of such an exchange.
-)", 0) \
+With the setting off, `CREATE OR REPLACE`, `REPLACE TABLE` and refreshes fail on such a filesystem with `UNSUPPORTED_METHOD`, and the error mentions this setting.
+
+A swap that a crash interrupted is finished when the database loads, regardless of this setting.
+
+If a swap fails and cannot be finished, DDL on its two tables, reads of their definitions, and `DROP DATABASE` and `DETACH DATABASE` of their database fail with `UNFINISHED_METADATA_EXCHANGE` until the server restarts. Inserts and selects still work. Until the restart, `system.warnings` has an entry about the last such swap. The error says what the restart does. When the temporary file is left, the load finishes the swap from the record, or fails with `CORRUPTED_DATA` if the files hold none of the recorded contents, and then the server does not start until the files are repaired by hand. When the temporary file is not left, the load removes the record and leaves the two files as they are, so compare them with the record before the restart.
+
+Before a downgrade to a version before 26.11, start the server once after a crash or after such a failure, so that the load finishes the swap. A version before 26.11 does not start while a database has a leftover `<table>.sql.tmp_exchange` file: the load of the database fails with `INCORRECT_FILE_NAME`.
+)", EXPERIMENTAL) \
     DECLARE(UInt64, database_catalog_unused_dir_hide_timeout_sec, 60 * 60, R"(
 Parameter of a task that cleans up garbage from `store/` directory.
 If some subdirectory is not used by clickhouse-server and this directory was not modified for last

@@ -541,6 +541,18 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query, 
             tryLogCurrentException("InterpreterDropQuery", "Async loading failed", LogsLevel::warning);
     }
 
+    /// Before anything below changes the database or its tables. The guards of the tables, taken below, check each table
+    /// only after the tables are prepared for shutdown. `TRUNCATE ALL TABLES` only truncates data, so it does not need the check.
+    /// A refresh of a view of the database that is running now can still fence two of its tables after this check, so the check
+    /// runs again after the views whose refreshes swap tables, those that are not `APPEND`, are prepared for shutdown, which stops
+    /// their refreshes and waits for a running one. A failure at the second check drops or detaches no table, but leaves those
+    /// views stopped until the server restarts. The other tables are prepared for shutdown only after the second check.
+    /// After the second check, only a `CREATE OR REPLACE` or `REPLACE TABLE`, or a refresh of a view of another database
+    /// whose target table is in this one, that fences a table while the query runs makes it fail at that table, like any DDL
+    /// that races with `DROP DATABASE`, and the tables before that one are dropped or detached already.
+    if (!truncate || !query.has_tables)
+        database->checkNoUnfinishedExchange(/* table_name */ "");
+
     getContext()->onQueryExecutionStarted();
     if (!truncate && database->hasReplicationThread())
         database->stopReplication();
@@ -646,6 +658,11 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query, 
                 tables_to_drop.clear();
 
                 prepare_tables(tables_to_prepare_early);
+
+                /// The second check, see the first one above. The refreshes that swap tables of the database are stopped now,
+                /// and no other table is prepared for shutdown yet. Without such views, no refresh of a view of the database
+                /// can fence a table, so the first check is enough.
+                database->checkNoUnfinishedExchange(/* table_name */ "");
 
                 collect_tables();
             }

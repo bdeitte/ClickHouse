@@ -110,6 +110,15 @@ function print_columns()
     done
 }
 
+# Prints the row of each of the tables `a` and `b`, which shows which data each metadata file points to.
+function print_rows()
+{
+    for table in a b
+    do
+        echo "$table rows: $($CLICKHOUSE_CLIENT -q "SELECT * FROM $DB.$table FORMAT CSV")"
+    done
+}
+
 # Prints whether file $2 holds the same content as file $3, under the name $1.
 function print_same()
 {
@@ -133,6 +142,7 @@ $CLICKHOUSE_CLIENT -q "DETACH DATABASE $DB"
 main_record > "$DIR/.a.sql.exchange"
 $CLICKHOUSE_CLIENT -q "ATTACH DATABASE $DB"
 print_columns
+print_rows
 print_dot_files "$DIR"
 echo
 restore_main
@@ -144,6 +154,7 @@ cp "$A" "$DIR/a.sql.tmp_exchange"
 rm -f -- "$DIR/a.sql"
 $CLICKHOUSE_CLIENT -q "ATTACH DATABASE $DB"
 print_columns
+print_rows
 print_dot_files "$DIR"
 echo
 restore_main
@@ -156,6 +167,7 @@ cp "$B" "$DIR/a.sql"
 rm -f -- "$DIR/b.sql"
 $CLICKHOUSE_CLIENT -q "ATTACH DATABASE $DB"
 print_columns
+print_rows
 print_dot_files "$DIR"
 echo
 restore_main
@@ -167,6 +179,7 @@ cp "$B" "$DIR/a.sql"
 cp "$A" "$DIR/b.sql"
 $CLICKHOUSE_CLIENT -q "ATTACH DATABASE $DB"
 print_columns
+print_rows
 print_dot_files "$DIR"
 echo
 restore_main

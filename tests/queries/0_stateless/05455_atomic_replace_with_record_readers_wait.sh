@@ -71,9 +71,6 @@ $CLICKHOUSE_CLIENT -q "SYSTEM ENABLE FAILPOINT $READER_FAILPOINT"
     if [[ "$output" == *'`y` UInt8'* ]]
     then
         echo "the reader sees the replaced table"
-    elif [[ "$output" == *'`x` UInt8'* && "$output" != *Exception* ]]
-    then
-        echo "the reader sees the old table"
     else
         echo "the reader failed: $output"
     fi
@@ -86,6 +83,12 @@ $CLICKHOUSE_CLIENT -q "SYSTEM ENABLE FAILPOINT $SWAP_FAILPOINT"
 $CLICKHOUSE_CLIENT -q "REPLACE TABLE $DB.t (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x" &
 swap_pid=$!
 $CLICKHOUSE_CLIENT -q "SYSTEM WAIT FAILPOINT $SWAP_FAILPOINT PAUSE"
+if [ -f "$DIR/t.sql" ]
+then
+    echo "t.sql exists during the pause"
+else
+    echo "t.sql is missing during the pause"
+fi
 
 # Released now, a reader without the lock reads the missing file and fails at once. With the lock, it waits.
 $CLICKHOUSE_CLIENT -q "SYSTEM NOTIFY FAILPOINT $READER_FAILPOINT"

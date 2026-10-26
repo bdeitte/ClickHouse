@@ -1,2 +1,3 @@
+t.sql is missing during the pause
 the reader waits for the moves
 the reader sees the replaced table

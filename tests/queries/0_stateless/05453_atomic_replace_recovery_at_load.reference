@@ -1,18 +1,26 @@
 case 1: the record only, before the swap
 a: x
 b: x,y
+a rows: 1
+b rows: 2,3
 
 case 2: after the first move
 a: x,y
 b: x
+a rows: 2,3
+b rows: 1
 
 case 3: after the second move
 a: x,y
 b: x
+a rows: 2,3
+b rows: 1
 
 case 4: after the third move
 a: x,y
 b: x
+a rows: 2,3
+b rows: 1
 
 case 5: a leftover temporary record and a leftover write of a finish
 a: x

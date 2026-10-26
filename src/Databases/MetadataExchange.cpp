@@ -29,6 +29,17 @@ constexpr auto exchange_record_suffix = ".exchange";
 constexpr auto exchange_record_header = "exchange v1";
 constexpr auto exchange_write_suffix = ".exchange_write";
 
+/// The ends of the names of the files of an exchange of the metadata file `t.sql` of a table. Constants, so that matching
+/// the name of every file of every database at load builds no strings.
+constexpr std::string_view sql_exchange_record_suffix = ".sql.exchange";
+constexpr std::string_view sql_exchange_record_tmp_suffix = ".sql.exchange.tmp";
+constexpr std::string_view sql_exchange_write_suffix = ".sql.exchange_write";
+constexpr std::string_view sql_exchange_tmp_suffix = ".sql.tmp_exchange";
+static_assert(sql_exchange_record_suffix.ends_with(exchange_record_suffix));
+static_assert(sql_exchange_record_tmp_suffix.starts_with(sql_exchange_record_suffix));
+static_assert(sql_exchange_write_suffix.ends_with(exchange_write_suffix));
+static_assert(sql_exchange_tmp_suffix.ends_with(metadata_exchange_tmp_suffix));
+
 std::optional<String> readMetadataFileIfExists(const DiskPtr & disk, const String & path)
 {
     if (!disk->existsFile(path))
@@ -55,11 +66,10 @@ void replaceMetadataFile(const DiskPtr & disk, const String & path, const String
 
 bool isMetadataExchangeFileName(const String & file_name)
 {
-    const String record_suffix = String(".sql") + exchange_record_suffix;
     if (!file_name.starts_with('.'))
-        return file_name.ends_with(String(".sql") + metadata_exchange_tmp_suffix);
-    return file_name.ends_with(record_suffix) || file_name.ends_with(record_suffix + ".tmp")
-        || file_name.ends_with(String(".sql") + exchange_write_suffix);
+        return file_name.ends_with(sql_exchange_tmp_suffix);
+    return file_name.ends_with(sql_exchange_record_suffix) || file_name.ends_with(sql_exchange_record_tmp_suffix)
+        || file_name.ends_with(sql_exchange_write_suffix);
 }
 
 String metadataExchangeRecordPath(const String & metadata_file_path)
@@ -179,9 +189,6 @@ void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & met
     /// The directory is scanned without a mutex: a database's own load cannot overlap its swaps.
     /// At server start, the load runs before the server accepts queries. `ATTACH DATABASE` holds the exclusive DDL guard
     /// of the database while it loads, and every table DDL guard takes that guard's mutex in shared mode first.
-    const String record_suffix = String(".sql") + exchange_record_suffix;
-    const String record_tmp_suffix = record_suffix + ".tmp";
-    const String write_suffix = String(".sql") + exchange_write_suffix;
     /// `metadata_dir` ends with a slash, and `parent_path` of a file in it does not.
     const fs::path dir = (fs::path(metadata_dir) / "x").parent_path();
     Strings record_paths;
@@ -192,9 +199,9 @@ void finishInterruptedMetadataExchanges(const DiskPtr & disk, const String & met
         if (!file_name.starts_with('.'))
             continue;
         const String path = (fs::path(metadata_dir) / file_name).string();
-        if (file_name.ends_with(record_suffix))
+        if (file_name.ends_with(sql_exchange_record_suffix))
             record_paths.push_back(path);
-        else if (file_name.ends_with(record_tmp_suffix) || file_name.ends_with(write_suffix))
+        else if (file_name.ends_with(sql_exchange_record_tmp_suffix) || file_name.ends_with(sql_exchange_write_suffix))
             leftover_paths.push_back(path);
     }
 

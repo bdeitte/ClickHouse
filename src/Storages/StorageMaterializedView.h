@@ -65,6 +65,10 @@ public:
     /// over-limit inner table that plain `DROP TABLE mv` would refuse.
     void checkTableSizeBelowDropLimit(ContextPtr query_context) const override;
 
+    /// Refuses `DROP` and `TRUNCATE` of the view while an exchange of the metadata files of an inner table
+    /// could not be finished. `DROP` calls it before it shuts the view down. See `IDatabase::checkNoUnfinishedExchange`.
+    void checkTableCanBeDropped(ContextPtr query_context) const override;
+
     void truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr, TableExclusiveLockHolder &) override;
 
     bool optimize(
@@ -159,6 +163,10 @@ private:
     friend class RefreshTask;
 
     void checkStatementCanBeForwarded() const;
+
+    /// The inner tables that `dropInnerTableIfAny` drops: none for a view without an inner table, otherwise the target table
+    /// and, when `fixed_uuid` is false, the `.tmp` table that a refresh fills and then exchanges with the target table.
+    std::vector<StorageID> getInnerTableIdsToDrop() const;
 
     ContextMutablePtr createRefreshContext(const String & log_comment) const;
     /// Prepare to refresh a refreshable materialized view: create temporary table (if needed) and

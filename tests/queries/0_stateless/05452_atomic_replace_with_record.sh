@@ -89,21 +89,36 @@ function print_leftover_files()
     echo "other files: $(ls "$1" | grep -vc '\.sql$')"
 }
 
-# Prints whether database $1 swapped metadata files with a record since the time $2.
+# Prints the number of swaps of metadata files with a record in database $1 since the time $2.
 function print_record_used()
 {
     $CLICKHOUSE_CLIENT -q "SYSTEM FLUSH LOGS text_log"
     $CLICKHOUSE_CLIENT -q "
-        SELECT if(count() > 0, 'swapped with a record', 'swapped without a record')
+        SELECT 'swaps with a record: ' || toString(count())
         FROM system.text_log
         WHERE event_date >= yesterday() AND toUnixTimestamp64Micro(event_time_microseconds) >= $2
             AND endsWith(logger_name, '($1)') AND message LIKE 'Exchanging % and % with an exchange record'"
+}
+
+# Prints whether the metadata file `t.sql` on disk defines column `y`.
+function print_file_has_y()
+{
+    if [ ! -f "$DIR/t.sql" ]
+    then
+        echo "on disk: t.sql is missing"
+    elif grep -q '`y` UInt8' "$DIR/t.sql"
+    then
+        echo "on disk has y: yes"
+    else
+        echo "on disk has y: no"
+    fi
 }
 
 echo "CREATE OR REPLACE TABLE"
 since=$(now_us)
 $CLICKHOUSE_CLIENT -q "CREATE OR REPLACE TABLE $DB.t (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x AS SELECT 1, 2"
 print_tables "$DB" t
+print_file_has_y
 print_leftover_files "$DIR"
 print_record_used "$DB" "$since"
 
@@ -111,6 +126,7 @@ echo "REPLACE TABLE"
 since=$(now_us)
 $CLICKHOUSE_CLIENT -q "REPLACE TABLE $DB.t (x UInt8) ENGINE = MergeTree ORDER BY x AS SELECT 3"
 print_tables "$DB" t
+print_file_has_y
 print_leftover_files "$DIR"
 print_record_used "$DB" "$since"
 
@@ -223,7 +239,10 @@ $CLICKHOUSE_CLIENT -q "
     CREATE TABLE $DB.b (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x;
 "
 since=$(now_us)
-$CLICKHOUSE_CLIENT -q "EXCHANGE TABLES $DB.a AND $DB.b" 2>&1 | grep -o 'UNSUPPORTED_METHOD' | head -n1
+error=$($CLICKHOUSE_CLIENT -q "EXCHANGE TABLES $DB.a AND $DB.b" 2>&1)
+echo "$error" | grep -o 'UNSUPPORTED_METHOD' | head -n1
+# Only the error for a filesystem without an atomic exchange with the server setting on says this.
+echo "$error" | grep -o 'are not emulated' | head -n1
 print_tables "$DB" a b
 print_leftover_files "$DIR"
 print_record_used "$DB" "$since"

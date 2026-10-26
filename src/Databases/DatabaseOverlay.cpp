@@ -161,6 +161,12 @@ void DatabaseOverlay::checkDetachedTableNotInUse(const UUID & uuid)
         db->checkDetachedTableNotInUse(uuid);
 }
 
+void DatabaseOverlay::checkNoUnfinishedExchange(const String & table_name) const
+{
+    for (const auto & db : databases)
+        db->checkNoUnfinishedExchange(table_name);
+}
+
 DatabaseDetachedTablesSnapshotIteratorPtr DatabaseOverlay::getDetachedTablesIterator(
     ContextPtr context_, const FilterByNameFunction & filter_by_table_name, bool skip_not_loaded) const
 {

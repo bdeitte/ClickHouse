@@ -36,6 +36,9 @@ public:
     StoragePtr detachTable(ContextPtr context, const String & table_name) override;
     void waitDetachedTableNotInUse(const UUID & uuid, std::function<void()> throw_if_cancelled) override;
     void checkDetachedTableNotInUse(const UUID & uuid) override;
+    /// Asks each member database, because the catalog calls it on the overlay, and a member `Atomic` database
+    /// can fence the names of a swap of metadata files that it could not finish.
+    void checkNoUnfinishedExchange(const String & table_name) const override;
     DatabaseDetachedTablesSnapshotIteratorPtr getDetachedTablesIterator(
         ContextPtr context, const FilterByNameFunction & filter_by_table_name, bool skip_not_loaded) const override;
 
