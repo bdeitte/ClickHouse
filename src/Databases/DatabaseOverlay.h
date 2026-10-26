@@ -45,7 +45,8 @@ public:
         IDatabase & to_database,
         const String & to_name,
         bool exchange,
-        bool dictionary) override;
+        bool dictionary,
+        bool allow_exchange_emulation) override;
 
     ASTPtr getCreateTableQueryImpl(const String & name, ContextPtr context, bool throw_on_error) const override;
 

@@ -68,7 +68,8 @@ public:
         IDatabase & to_database,
         const String & to_table_name,
         bool exchange,
-        bool dictionary) override;
+        bool dictionary,
+        bool allow_exchange_emulation) override;
 
     void drop(ContextPtr context) override;
 

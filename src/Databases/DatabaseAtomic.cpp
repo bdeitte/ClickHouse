@@ -1,5 +1,6 @@
 #include <filesystem>
 #include <thread>
+#include <Core/ServerSettings.h>
 #include <Core/Settings.h>
 #include <Core/UUID.h>
 #include <Databases/DatabaseAtomic.h>
@@ -7,6 +8,8 @@
 #include <Databases/DatabaseMetadataDiskSettings.h>
 #include <Databases/DatabaseOnDisk.h>
 #include <Databases/DatabaseReplicated.h>
+#include <Databases/MetadataExchange.h>
+#include <Disks/DiskLocal.h>
 #include <Disks/IStoragePolicy.h>
 #include <Interpreters/DDLTask.h>
 #include <Interpreters/DatabaseCatalog.h>
@@ -33,11 +36,18 @@ namespace Setting
 {
     extern const SettingsBool check_referential_table_dependencies;
     extern const SettingsBool check_table_dependencies;
+    extern const SettingsBool fsync_metadata;
+}
+
+namespace ServerSetting
+{
+    extern const ServerSettingsBool database_atomic_allow_exchange_emulation;
 }
 
 namespace FailPoints
 {
     extern const char rename_database_after_dependency_check[];
+    extern const char database_atomic_exchange_not_supported[];
 }
 
 namespace ErrorCodes
@@ -53,6 +63,7 @@ namespace ErrorCodes
     extern const int ABORTED;
     extern const int LOGICAL_ERROR;
     extern const int UNFINISHED;
+    extern const int UNSUPPORTED_METHOD;
 }
 
 
@@ -250,7 +261,7 @@ void DatabaseAtomic::dropTableImpl(ContextPtr local_context, const String & tabl
 }
 
 void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_name, IDatabase & to_database,
-                                 const String & to_table_name, bool exchange, bool dictionary)
+                                 const String & to_table_name, bool exchange, bool dictionary, bool allow_exchange_emulation)
     TSA_NO_THREAD_SAFETY_ANALYSIS   /// TSA does not support conditional locking
 {
     auto component_guard = Coordination::setCurrentComponent("DatabaseAtomic::renameTable");
@@ -259,7 +270,8 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
         if (typeid_cast<DatabaseOrdinary *>(&to_database))
         {
             /// Allow moving tables between Atomic and Ordinary (with table lock)
-            DatabaseOnDisk::renameTable(local_context, table_name, to_database, to_table_name, exchange, dictionary);
+            DatabaseOnDisk::renameTable(
+                local_context, table_name, to_database, to_table_name, exchange, dictionary, allow_exchange_emulation);
             return;
         }
 
@@ -276,6 +288,12 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
 
     auto & other_db = dynamic_cast<DatabaseAtomic &>(to_database);
     bool inside_database = this == &other_db;
+
+    /// Where the filesystem cannot exchange two files atomically, such as NFS, an exchange of two metadata files can be emulated
+    /// with three moves and a record, see `exchangeMetadataFilesWithRecord`. Only inside one database that is exactly `Atomic`,
+    /// so not `Replicated`, on a local disk, and only with the server setting on. Everything else exchanges as without the emulation.
+    const bool emulation_possible = exchange && inside_database && typeid(*this) == typeid(DatabaseAtomic)
+        && canEmulateExchange(getDisk()) && local_context->getServerSettings()[ServerSetting::database_atomic_allow_exchange_emulation];
 
     ensurePopulated();
     if (!inside_database)
@@ -391,9 +409,44 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
     /// NOTE: replica will be lost if server crashes before the following rename
     /// TODO better detection and recovery
     if (exchange)
-        db_disk->renameExchange(old_metadata_path, new_metadata_path);
+    {
+        /// Makes the filesystem report that it cannot exchange two files atomically, as NFS does.
+        bool exchange_not_supported = false;
+        fiu_do_on(FailPoints::database_atomic_exchange_not_supported, { exchange_not_supported = true; });
+
+        if (emulation_possible && allow_exchange_emulation)
+        {
+            /// It returns `false` when the filesystem does not support the exchange, and throws on every other error.
+            if (exchange_not_supported || !db_disk->renameExchangeIfSupported(old_metadata_path, new_metadata_path))
+            {
+                /// What each of the two files holds after the exchange.
+                MetadataExchangeRecord record;
+                record.old_path = old_metadata_path;
+                record.new_path = new_metadata_path;
+                record.old_path_content = readMetadataFile(db_disk, new_metadata_path);
+                record.new_path_content = readMetadataFile(db_disk, old_metadata_path);
+                const bool fsync = local_context->getSettingsRef()[Setting::fsync_metadata];
+                const String record_path = writeMetadataExchangeRecord(db_disk, record, fsync);
+                exchangeMetadataFilesWithRecord(table_name, to_table_name, db_disk, record, record_path, fsync);
+            }
+        }
+        else if (emulation_possible && exchange_not_supported)
+        {
+            throw Exception(
+                ErrorCodes::UNSUPPORTED_METHOD,
+                "Cannot exchange {} and {}: the filesystem does not support an atomic exchange of files",
+                old_metadata_path,
+                new_metadata_path);
+        }
+        else
+        {
+            db_disk->renameExchange(old_metadata_path, new_metadata_path);
+        }
+    }
     else
+    {
         db_disk->moveFile(old_metadata_path, new_metadata_path);
+    }
 
     /// After metadata was successfully moved, the following methods should not throw (if they do, it's a logical error)
     table_data_path = detach(*this, table_name, table->storesDataOnDisk());
@@ -586,6 +639,31 @@ void DatabaseAtomic::beforeLoadingMetadata(ContextMutablePtr /*context*/, Loadin
 
         db_disk->removeFileIfExists(table_path);
     }
+}
+
+bool DatabaseAtomic::canEmulateExchange(const DiskPtr & disk)
+{
+    return dynamic_cast<const DiskLocal *>(disk.get()) != nullptr;
+}
+
+void DatabaseAtomic::exchangeMetadataFilesWithRecord(
+    const String & /* table_name */,
+    const String & /* other_table_name */,
+    const DiskPtr & disk,
+    const MetadataExchangeRecord & record,
+    const String & record_path,
+    bool /* fsync */)
+{
+    LOG_DEBUG(log, "Exchanging {} and {} with an exchange record", record.old_path, record.new_path);
+
+    /// The temporary file exists only between the first and the last move, so it shows that an exchange is in progress.
+    const String tmp_path = metadataExchangeTmpPath(record.old_path);
+    disk->moveFile(record.old_path, tmp_path);
+    disk->moveFile(record.new_path, record.old_path);
+    disk->moveFile(tmp_path, record.new_path);
+
+    /// Without the temporary file, the record is harmless, and the next load removes it.
+    tryRemoveMetadataExchangeFiles(disk, {record_path}, log, /* found_at_load */ false);
 }
 
 LoadTaskPtr DatabaseAtomic::startupDatabaseAsync(AsyncLoader & async_loader, LoadJobSet startup_after, LoadingStrictnessLevel mode)

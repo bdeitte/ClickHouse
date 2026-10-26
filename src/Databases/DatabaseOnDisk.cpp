@@ -521,7 +521,8 @@ void DatabaseOnDisk::renameTable(
         IDatabase & to_database,
         const String & to_table_name,
         bool exchange,
-        bool dictionary)
+        bool dictionary,
+        bool /* allow_exchange_emulation */)
 {
     if (exchange)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Tables can be exchanged only in Atomic databases");

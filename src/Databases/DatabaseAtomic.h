@@ -9,6 +9,8 @@
 namespace DB
 {
 
+struct MetadataExchangeRecord;
+
 /// All tables in DatabaseAtomic have persistent UUID and store data in
 /// /clickhouse_path/store/xxx/xxxyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy/
 /// where xxxyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy is UUID of the table.
@@ -46,7 +48,8 @@ public:
             IDatabase & to_database,
             const String & to_table_name,
             bool exchange,
-            bool dictionary) override;
+            bool dictionary,
+            bool allow_exchange_emulation) override;
 
     void dropTable(ContextPtr context, const String & table_name, bool sync) override;
     void dropTableImpl(ContextPtr context, const String & table_name, bool sync);
@@ -62,6 +65,9 @@ public:
     DatabaseTablesIteratorPtr getTablesIterator(ContextPtr context, const FilterByNameFunction & filter_by_table_name, bool skip_not_loaded) const override;
 
     void beforeLoadingMetadata(ContextMutablePtr context, LoadingStrictnessLevel mode) override;
+
+    /// Whether an exchange of metadata files on `disk` can be done with three moves and a record when the disk has no atomic exchange.
+    static bool canEmulateExchange(const DiskPtr & disk);
 
     LoadTaskPtr startupDatabaseAsync(AsyncLoader & async_loader, LoadJobSet startup_after, LoadingStrictnessLevel mode) override;
     void waitDatabaseStarted() const override;
@@ -107,6 +113,18 @@ protected:
     const UUID db_uuid;
 
     LoadTaskPtr startup_atomic_database_task TSA_GUARDED_BY(mutex);
+
+private:
+    /// Exchanges the two metadata files of `record` in this database with three moves, instead of an atomic exchange,
+    /// and then removes the record at `record_path` that `writeMetadataExchangeRecord` wrote.
+    /// The caller holds `mutex` and the DDL guards of `table_name` and `other_table_name`.
+    void exchangeMetadataFilesWithRecord(
+        const String & table_name,
+        const String & other_table_name,
+        const DiskPtr & disk,
+        const MetadataExchangeRecord & record,
+        const String & record_path,
+        bool fsync) TSA_REQUIRES(mutex);
 };
 
 }

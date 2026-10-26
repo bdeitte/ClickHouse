@@ -451,13 +451,17 @@ public:
     virtual Strings getNamesOfPermanentlyDetachedTables() const;
 
     /// Rename the table and possibly move the table to another database.
+    /// `allow_exchange_emulation` lets `DatabaseAtomic` emulate an exchange of the metadata files with three moves and a record
+    /// where the filesystem cannot exchange them atomically. Only the internal exchanges of `CREATE OR REPLACE` and of refreshes
+    /// of materialized views pass `true`, see `InterpreterRenameQuery::setAllowExchangeEmulation`.
     virtual void renameTable(
         ContextPtr /*context*/,
         const String & /*name*/,
         IDatabase & /*to_database*/,
         const String & /*to_name*/,
         bool /*exchange*/,
-        bool /*dictionary*/);
+        bool /*dictionary*/,
+        bool /*allow_exchange_emulation*/);
 
     using ASTModifier = std::function<void(IAST &)>;
 

@@ -59,7 +59,8 @@ public:
         IDatabase & to_database,
         const String & to_table_name,
         bool exchange,
-        bool dictionary) override;
+        bool dictionary,
+        bool allow_exchange_emulation) override;
 
     void alterTable(ContextPtr context, const StorageID & table_id, const StorageInMemoryMetadata & metadata, bool validate_new_create_query) override;
 

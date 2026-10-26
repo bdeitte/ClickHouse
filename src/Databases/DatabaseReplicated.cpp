@@ -1817,7 +1817,9 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
             std::lock_guard lock{metadata_mutex};
             UInt64 new_digest = tables_metadata_digest;
             new_digest -= getMetadataHash(broken_table_name);
-            DatabaseAtomic::renameTable(make_query_context(), broken_table_name, *to_db_ptr, to_name, /* exchange */ false, /* dictionary */ false);
+            DatabaseAtomic::renameTable(
+                make_query_context(), broken_table_name, *to_db_ptr, to_name,
+                /* exchange */ false, /* dictionary */ false, /* allow_exchange_emulation */ false);
             tables_metadata_digest = new_digest;
             assertDigest(getContext());
             ++moved_tables;
@@ -1881,7 +1883,7 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
         new_digest -= DB::getMetadataHash(from, statement);
         new_digest += DB::getMetadataHash(to, statement);
 
-        DatabaseAtomic::renameTable(make_query_context(), from, *this, to, false, false);
+        DatabaseAtomic::renameTable(make_query_context(), from, *this, to, false, false, /* allow_exchange_emulation */ false);
 
         tables_metadata_digest = new_digest;
         assertDigest(getContext());
@@ -2657,7 +2659,7 @@ void DatabaseReplicated::dropTable(ContextPtr local_context, const String & tabl
 }
 
 void DatabaseReplicated::renameTable(ContextPtr local_context, const String & table_name, IDatabase & to_database,
-                                     const String & to_table_name, bool exchange, bool dictionary)
+                                     const String & to_table_name, bool exchange, bool dictionary, bool allow_exchange_emulation)
 {
     auto txn = local_context->getZooKeeperMetadataTransaction();
     chassert(txn);
@@ -2726,7 +2728,7 @@ void DatabaseReplicated::renameTable(ContextPtr local_context, const String & ta
     if (txn && !is_recovering)
         txn->addOp(zkutil::makeSetRequest(replica_path + "/digest", toString(new_digest), -1));
 
-    DatabaseAtomic::renameTable(local_context, table_name, to_database, to_table_name, exchange, dictionary);
+    DatabaseAtomic::renameTable(local_context, table_name, to_database, to_table_name, exchange, dictionary, allow_exchange_emulation);
 
     tables_metadata_digest = new_digest;
     assertDigest(local_context);

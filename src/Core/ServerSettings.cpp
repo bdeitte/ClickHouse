@@ -544,6 +544,13 @@ A value of `0` means all cores.
 The delay during which a dropped table can be restored using the [`UNDROP`](/reference/statements/undrop) statement. If `DROP TABLE` ran with a `SYNC` modifier, the setting is ignored.
 The default for this setting is `480` (8 minutes).
 )", 0) \
+    DECLARE(Bool, database_atomic_allow_exchange_emulation, false, R"(
+When enabled, on a local disk whose filesystem cannot exchange two files atomically, such as NFS or EFS, `Atomic` databases emulate the exchange of two metadata files with three renames and a durable record. This keeps `CREATE OR REPLACE`, `REPLACE TABLE` and refreshes of refreshable materialized views working and crash-safe on such filesystems. It does not apply to `EXCHANGE TABLES`, `EXCHANGE DICTIONARIES` or `Replicated` databases, which still fail on such filesystems with an error.
+
+Exchanges that a crash interrupted are finished when the database loads, regardless of this setting.
+
+After a crash, start the server once more before a downgrade to a ClickHouse version before 26.11, so that it finishes the interrupted exchanges. Those versions refuse to load a database that has the temporary file `<table>.sql.tmp_exchange` of such an exchange.
+)", 0) \
     DECLARE(UInt64, database_catalog_unused_dir_hide_timeout_sec, 60 * 60, R"(
 Parameter of a task that cleans up garbage from `store/` directory.
 If some subdirectory is not used by clickhouse-server and this directory was not modified for last

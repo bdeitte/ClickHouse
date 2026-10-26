@@ -198,7 +198,8 @@ void DatabaseOverlay::renameTable(
     IDatabase & to_database,
     const String & to_name,
     bool exchange,
-    bool dictionary)
+    bool dictionary,
+    bool allow_exchange_emulation)
 {
     for (auto & db : databases)
     {
@@ -211,12 +212,13 @@ void DatabaseOverlay::renameTable(
                 if (to_overlay_database->databases.empty())
                     throw Exception(ErrorCodes::BAD_ARGUMENTS, "The destination Overlay database {} does not have any members", to_database.getDatabaseName());
 
-                db->renameTable(current_context, name, *to_overlay_database->databases[0], to_name, exchange, dictionary);
+                db->renameTable(
+                    current_context, name, *to_overlay_database->databases[0], to_name, exchange, dictionary, allow_exchange_emulation);
             }
             else
             {
                 /// Renaming into a different type of database. E.g. from Overlay on top of Atomic database into just Atomic database.
-                db->renameTable(current_context, name, to_database, to_name, exchange, dictionary);
+                db->renameTable(current_context, name, to_database, to_name, exchange, dictionary, allow_exchange_emulation);
             }
 
             return;
