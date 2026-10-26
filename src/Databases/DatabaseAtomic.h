@@ -4,6 +4,7 @@
 #include <Databases/DatabaseOrdinary.h>
 #include <Databases/DatabasesCommon.h>
 #include <Storages/IStorage_fwd.h>
+#include <Common/SharedMutex.h>
 
 
 namespace DB
@@ -85,9 +86,17 @@ public:
     void checkDetachedTableNotInUse(const UUID & uuid) override;
     void setDetachedTableNotInUseForce(const UUID & uuid) override;
 
+    /// Waits for the moves of a swap with a record, see `metadata_files_mutex`.
+    time_t getObjectMetadataModificationTime(const String & object_name) const override;
+
 protected:
     /// Finishes a swap that a crash interrupted, before `iterateMetadataFiles` processes any metadata file.
     bool finishInterruptedMetadataExchangesAtLoad() const override;
+
+    /// Waits for the moves of a swap with a record, see `metadata_files_mutex`.
+    ASTPtr readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const override;
+    /// Waits for the moves of a swap with a record, see `metadata_files_mutex`.
+    String readObjectMetadataFile(const String & object_name) const override;
 
     void commitAlterTable(const StorageID & table_id, const String & table_metadata_tmp_path, const String & table_metadata_path, const String & statement, ContextPtr query_context) override;
     void commitCreateTable(const ASTCreateQuery & query, const StoragePtr & table,
@@ -118,6 +127,11 @@ protected:
     LoadTaskPtr startup_atomic_database_task TSA_GUARDED_BY(mutex);
 
 private:
+    /// Held exclusively by a swap of metadata files with a record while it moves the files and handles the failure of a move,
+    /// because one `.sql` file is missing between the moves. The readers of a metadata file that do not take `mutex` hold it shared.
+    /// A swap takes it while it holds `mutex`, so a reader must not take `mutex` while it holds this mutex.
+    mutable SharedMutex metadata_files_mutex;
+
     /// Exchanges the two metadata files of `record` in this database with three moves, instead of an atomic exchange,
     /// and then removes the record at `record_path` that `writeMetadataExchangeRecord` wrote.
     /// The caller holds `mutex` and the DDL guards of `table_name` and `other_table_name`.

@@ -54,6 +54,8 @@ namespace FailPoints
     extern const char database_atomic_exchange_fail_after_third_move[];
     extern const char database_atomic_exchange_always_fail_before_first_move[];
     extern const char database_atomic_exchange_fail_to_finish[];
+    extern const char database_atomic_exchange_pause_after_second_move[];
+    extern const char database_atomic_pause_before_reading_create_query[];
 }
 
 namespace ErrorCodes
@@ -77,6 +79,15 @@ namespace ErrorCodes
 namespace DatabaseMetadataDiskSetting
 {
 extern const DatabaseMetadataDiskSettingsString disk;
+}
+
+namespace
+{
+
+/// Only a query whose id starts with the prefix pauses at `database_atomic_pause_before_reading_create_query`,
+/// so that the readers of other queries and of background threads do not take the pause meant for a test.
+constexpr std::string_view pause_before_reading_create_query_query_id_prefix = "atomic_pause_before_reading_create_query_";
+
 }
 
 class AtomicDatabaseTablesSnapshotIterator final : public DatabaseTablesSnapshotIterator
@@ -648,6 +659,29 @@ void DatabaseAtomic::beforeLoadingMetadata(ContextMutablePtr /*context*/, Loadin
     }
 }
 
+ASTPtr DatabaseAtomic::readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const
+{
+    /// Lets a test hold a reader that has found the table until a swap is between its moves. This runs for every table in
+    /// `system.tables`, so the check of the query id comes second: it is not evaluated in builds without failpoints.
+    if (FailPointInjection::hasAnyFailPointBeenRegistered()
+        && CurrentThread::getQueryId().starts_with(pause_before_reading_create_query_query_id_prefix))
+        FailPointInjection::pauseFailPoint(FailPoints::database_atomic_pause_before_reading_create_query);
+    std::shared_lock files_lock(metadata_files_mutex);
+    return DatabaseOrdinary::readCreateQueryFromMetadataFile(table_name, throw_on_error);
+}
+
+String DatabaseAtomic::readObjectMetadataFile(const String & object_name) const
+{
+    std::shared_lock files_lock(metadata_files_mutex);
+    return DatabaseOrdinary::readObjectMetadataFile(object_name);
+}
+
+time_t DatabaseAtomic::getObjectMetadataModificationTime(const String & object_name) const
+{
+    std::shared_lock files_lock(metadata_files_mutex);
+    return DatabaseOrdinary::getObjectMetadataModificationTime(object_name);
+}
+
 bool DatabaseAtomic::finishInterruptedMetadataExchangesAtLoad() const
 {
     /// This does not read the server setting `database_atomic_allow_exchange_emulation`: a crash can leave files of a swap
@@ -676,6 +710,9 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
     const String & record_path,
     bool fsync)
 {
+    /// Readers of the metadata files wait until the moves and the handling of their failure are over.
+    std::unique_lock files_lock(metadata_files_mutex);
+
     LOG_DEBUG(log, "Exchanging {} and {} with an exchange record", record.old_path, record.new_path);
 
     /// The temporary file exists only between the first and the last move, so it shows that an exchange is in progress.
@@ -694,6 +731,8 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
             disk->moveFile(record.new_path, record.old_path);
             fiu_do_on(FailPoints::database_atomic_exchange_fail_after_second_move,
                 { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the second move of an exchange"); });
+            /// Lets a test hold the swap while a file is missing, to check that readers wait for the moves.
+            FailPointInjection::pauseFailPoint(FailPoints::database_atomic_exchange_pause_after_second_move);
             disk->moveFile(tmp_path, record.new_path);
             fiu_do_on(FailPoints::database_atomic_exchange_fail_after_third_move,
                 { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the third move of an exchange"); });

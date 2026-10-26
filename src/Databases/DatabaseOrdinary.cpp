@@ -1125,7 +1125,7 @@ void DatabaseOrdinary::alterTable(ContextPtr local_context, const StorageID & ta
     /// Read the definition of the table and replace the necessary parts with new ones.
     String table_metadata_path = getObjectMetadataPath(table_name);
     String table_metadata_tmp_path = table_metadata_path + ".tmp";
-    String statement = readMetadataFile(db_disk, table_metadata_path);
+    String statement = readObjectMetadataFile(table_name);
 
     ParserCreateQuery parser;
     ASTPtr ast = parseQuery(

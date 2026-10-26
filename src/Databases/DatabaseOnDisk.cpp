@@ -1039,10 +1039,19 @@ ASTPtr DatabaseOnDisk::parseQueryFromMetadata(
     return ast;
 }
 
+ASTPtr DatabaseOnDisk::readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const
+{
+    return parseQueryFromMetadata(log, getContext(), getDisk(), getObjectMetadataPath(table_name), throw_on_error);
+}
+
+String DatabaseOnDisk::readObjectMetadataFile(const String & object_name) const
+{
+    return readMetadataFile(getDisk(), getObjectMetadataPath(object_name));
+}
+
 ASTPtr DatabaseOnDisk::getCreateQueryFromMetadata(const String & table_name, bool throw_on_error) const
 {
-    auto db_disk = getDisk();
-    ASTPtr ast = parseQueryFromMetadata(log, getContext(), db_disk, getObjectMetadataPath(table_name), throw_on_error);
+    ASTPtr ast = readCreateQueryFromMetadataFile(table_name, throw_on_error);
 
     if (ast)
     {
