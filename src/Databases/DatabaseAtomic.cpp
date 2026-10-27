@@ -833,8 +833,14 @@ bool DatabaseAtomic::undoInterruptedMetadataExchangesAtLoad() const
     if (typeid(*this) != typeid(DatabaseAtomic))
         return false;
     auto db_disk = getDisk();
-    if (!canEmulateExchange(db_disk) || db_disk->isReadOnly())
+    if (!canEmulateExchange(db_disk))
         return false;
+    /// The load cannot undo a swap on a read-only disk, so it refuses the files of a swap that the server did not apply.
+    if (db_disk->isReadOnly())
+    {
+        checkNoMetadataExchangeToUndo(db_disk, getMetadataPath(), log);
+        return false;
+    }
     const bool fsync = getContext()->getGlobalContext()->getSettingsRef()[Setting::fsync_metadata];
     undoInterruptedMetadataExchanges(db_disk, getMetadataPath(), fsync, log);
     return true;

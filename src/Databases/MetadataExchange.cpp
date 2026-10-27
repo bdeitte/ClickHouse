@@ -20,6 +20,7 @@ namespace ErrorCodes
 {
     extern const int CANNOT_PARSE_ESCAPE_SEQUENCE;
     extern const int CORRUPTED_DATA;
+    extern const int INCORRECT_FILE_NAME;
 }
 
 namespace
@@ -213,15 +214,23 @@ void undoMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & r
     writeMetadataExchangeFiles(disk, record, record.new_path_content, record.old_path_content, fsync);
 }
 
-void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metadata_dir, bool fsync, const LoggerPtr & log)
+namespace
 {
-    /// The directory is scanned without a mutex: a database's own load cannot overlap its swaps.
-    /// At server start, the load runs before the server accepts queries. `ATTACH DATABASE` holds the exclusive DDL guard
-    /// of the database while it loads, and every table DDL guard takes that guard's mutex in shared mode first.
-    /// `metadata_dir` ends with a slash, and `parent_path` of a file in it does not.
-    const fs::path dir = (fs::path(metadata_dir) / "x").parent_path();
+
+struct MetadataExchangeFiles
+{
+    /// The records of exchanges.
     Strings record_paths;
+    /// Leftover temporary records and writes of a finish or an undo.
     Strings leftover_paths;
+};
+
+/// The directory is scanned without a mutex: a database's own load cannot overlap its swaps.
+/// At server start, the load runs before the server accepts queries. `ATTACH DATABASE` holds the exclusive DDL guard
+/// of the database while it loads, and every table DDL guard takes that guard's mutex in shared mode first.
+MetadataExchangeFiles listMetadataExchangeFiles(const DiskPtr & disk, const String & metadata_dir)
+{
+    MetadataExchangeFiles files;
     for (const auto it = disk->iterateDirectory(metadata_dir); it->isValid(); it->next())
     {
         const String file_name = it->name();
@@ -229,10 +238,83 @@ void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metad
             continue;
         const String path = (fs::path(metadata_dir) / file_name).string();
         if (file_name.ends_with(sql_exchange_record_suffix))
-            record_paths.push_back(path);
+            files.record_paths.push_back(path);
         else if (file_name.ends_with(sql_exchange_record_tmp_suffix) || file_name.ends_with(sql_exchange_write_suffix))
-            leftover_paths.push_back(path);
+            files.leftover_paths.push_back(path);
     }
+    return files;
+}
+
+/// Reads the record `record_path` in `metadata_dir`. Returns nothing when the file is gone, or, with a warning, when it is
+/// not a record of an exchange of two files in `metadata_dir`.
+std::optional<MetadataExchangeRecord> readMetadataExchangeRecord(
+    const DiskPtr & disk, const String & record_path, const String & metadata_dir, const LoggerPtr & log)
+{
+    const auto content = readMetadataFileIfExists(disk, record_path);
+    if (!content)
+        return {};
+
+    /// `metadata_dir` ends with a slash, and `parent_path` of a file in it does not.
+    const fs::path dir = (fs::path(metadata_dir) / "x").parent_path();
+    auto record = parseMetadataExchangeRecord(*content);
+    if (!record
+        || record_path != metadataExchangeRecordPath(record->old_path)
+        || fs::path(record->old_path).parent_path() != dir
+        || fs::path(record->new_path).parent_path() != dir)
+    {
+        LOG_WARNING(log, "{} is not an exchange record, leaving it as is", record_path);
+        return {};
+    }
+    return record;
+}
+
+/// For an exchange in the state `Inconsistent`, which no load can undo, so the files need a repair by hand.
+/// A record is left only by a crash during its exchange, by a fence, or by an exchange that could not remove it, which is
+/// fenced too. Until the restart, the crash or the fence kept DDL from changing the two files, so a content that is not
+/// recorded comes from outside the server.
+[[noreturn]] void throwCannotUndoMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, const String & record_path)
+{
+    const String tmp_path = metadataExchangeTmpPath(record.old_path);
+    const bool tmp_exists = disk->existsFile(tmp_path);
+    throw Exception(
+        ErrorCodes::CORRUPTED_DATA,
+        "Cannot undo the exchange of {} and {} recorded in {}: {} holds none of the recorded contents. The files are left "
+        "as they are. To repair manually, compare the two files{} with the two contents in the record, restore the "
+        "intended content of each of the two files, remove the record{}, and load the database again",
+        record.old_path, record.new_path, record_path,
+        tmp_exists ? fmt::format("the temporary file {} or one of the two files", tmp_path) : "one of the two files",
+        tmp_exists ? " and the temporary file" : "",
+        tmp_exists ? " and the temporary file" : "");
+}
+
+}
+
+void checkNoMetadataExchangeToUndo(const DiskPtr & disk, const String & metadata_dir, const LoggerPtr & log)
+{
+    /// A record means that the server did not apply its exchange, see `undoInterruptedMetadataExchanges`. A load that cannot
+    /// write cannot undo the exchange, so it loads the two files only while they hold their contents from before it.
+    for (const auto & record_path : listMetadataExchangeFiles(disk, metadata_dir).record_paths)
+    {
+        const auto record = readMetadataExchangeRecord(disk, record_path, metadata_dir, log);
+        if (!record)
+            continue;
+        const auto state = inspectMetadataExchange(disk, *record);
+        if (state == MetadataExchangeState::BeforeExchange)
+            continue;
+        /// A writable disk would not help: its load refuses the files too.
+        if (state == MetadataExchangeState::Inconsistent)
+            throwCannotUndoMetadataExchange(disk, *record, record_path);
+        throw Exception(
+            ErrorCodes::INCORRECT_FILE_NAME,
+            "Cannot load the metadata in {}: the exchange of {} and {} recorded in {} was not applied by the server, and the disk "
+            "is read-only, so the load cannot undo it. Load the database once from a writable disk, which undoes the exchange",
+            metadata_dir, record->old_path, record->new_path, record_path);
+    }
+}
+
+void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metadata_dir, bool fsync, const LoggerPtr & log)
+{
+    const auto [record_paths, leftover_paths] = listMetadataExchangeFiles(disk, metadata_dir);
 
     /// A record is complete before its exchange begins, so a leftover temporary record belongs to an exchange that did not begin.
     /// A leftover write of a finish or of an undo belongs to an exchange whose temporary file is still there, so undoing it below
@@ -242,19 +324,9 @@ void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metad
     bool removed_records = false;
     for (const auto & record_path : record_paths)
     {
-        const auto content = readMetadataFileIfExists(disk, record_path);
-        if (!content)
+        const auto record = readMetadataExchangeRecord(disk, record_path, metadata_dir, log);
+        if (!record)
             continue;
-
-        const auto record = parseMetadataExchangeRecord(*content);
-        if (!record
-            || record_path != metadataExchangeRecordPath(record->old_path)
-            || fs::path(record->old_path).parent_path() != dir
-            || fs::path(record->new_path).parent_path() != dir)
-        {
-            LOG_WARNING(log, "{} is not an exchange record, leaving it as is", record_path);
-            continue;
-        }
 
         /// A record means that its exchange did not reach the tables in memory: an exchange removes its record, and checks that
         /// it is gone, before it renames the tables in memory, and when it cannot, it fences the two tables and leaves the record.
@@ -262,8 +334,6 @@ void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metad
         /// was fenced, the server served the two tables under their old names until the restart, and inserts reached them there.
         /// So the exchange is undone, not finished, which keeps each table under the name the server served it with. That holds
         /// with or without the temporary file: the moves or a finish may have completed before the crash or the fence.
-        const String tmp_path = metadataExchangeTmpPath(record->old_path);
-        const bool tmp_exists = disk->existsFile(tmp_path);
         switch (inspectMetadataExchange(disk, *record))
         {
             case MetadataExchangeState::BeforeExchange:
@@ -279,18 +349,7 @@ void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metad
                     record->old_path, record->new_path, record_path);
                 break;
             case MetadataExchangeState::Inconsistent:
-                /// A record is left only by a crash during its exchange, by a fence, or by an exchange that could not remove it,
-                /// which is fenced too. Until the restart, the crash or the fence kept DDL from changing the two files, so a
-                /// content that is not recorded comes from outside the server.
-                throw Exception(
-                    ErrorCodes::CORRUPTED_DATA,
-                    "Cannot undo the exchange of {} and {} recorded in {}: {} holds none of the recorded contents. The files are left "
-                    "as they are. To repair manually, compare the two files{} with the two contents in the record, restore the "
-                    "intended content of each of the two files, remove the record{}, and load the database again",
-                    record->old_path, record->new_path, record_path,
-                    tmp_exists ? fmt::format("the temporary file {} or one of the two files", tmp_path) : "one of the two files",
-                    tmp_exists ? " and the temporary file" : "",
-                    tmp_exists ? " and the temporary file" : "");
+                throwCannotUndoMetadataExchange(disk, *record, record_path);
         }
 
         /// Not best effort: a record left after the load would make a later load refuse the database once DDL changes either
