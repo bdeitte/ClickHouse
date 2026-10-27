@@ -293,22 +293,31 @@ void checkNoMetadataExchangeToUndo(const DiskPtr & disk, const String & metadata
 {
     /// A record means that the server did not apply its exchange, see `undoInterruptedMetadataExchanges`. A load that cannot
     /// write cannot undo the exchange, so it loads the two files only while they hold their contents from before it.
+    /// Every record is inspected before the advice to load from a writable disk, because that load would fail on an
+    /// exchange whose files hold contents it did not record, wherever its record is in the listing.
+    std::optional<std::pair<MetadataExchangeRecord, String>> to_undo;
     for (const auto & record_path : listMetadataExchangeFiles(disk, metadata_dir).record_paths)
     {
-        const auto record = readMetadataExchangeRecord(disk, record_path, metadata_dir, log);
+        auto record = readMetadataExchangeRecord(disk, record_path, metadata_dir, log);
         if (!record)
             continue;
         const auto state = inspectMetadataExchange(disk, *record);
         if (state == MetadataExchangeState::BeforeExchange)
             continue;
-        /// A writable disk would not help: its load refuses the files too.
         if (state == MetadataExchangeState::Inconsistent)
             throwCannotUndoMetadataExchange(disk, *record, record_path);
+        if (!to_undo)
+            to_undo.emplace(std::move(*record), record_path);
+    }
+
+    if (to_undo)
+    {
+        const auto & [record, record_path] = *to_undo;
         throw Exception(
             ErrorCodes::INCORRECT_FILE_NAME,
             "Cannot load the metadata in {}: the exchange of {} and {} recorded in {} was not applied by the server, and the disk "
             "is read-only, so the load cannot undo it. Load the database once from a writable disk, which undoes the exchange",
-            metadata_dir, record->old_path, record->new_path, record_path);
+            metadata_dir, record.old_path, record.new_path, record_path);
     }
 }
 

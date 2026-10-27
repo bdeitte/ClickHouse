@@ -84,8 +84,8 @@ void undoMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & r
 void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metadata_dir, bool fsync, const LoggerPtr & log);
 
 /// Called instead of `undoInterruptedMetadataExchanges` when a database on a read-only `disk` is loaded. Throws
-/// `INCORRECT_FILE_NAME` when an exchange recorded in `metadata_dir` would need an undo, or `CORRUPTED_DATA` when its files
-/// hold contents it did not record, as `undoInterruptedMetadataExchanges` does. Changes no file.
+/// `CORRUPTED_DATA`, as `undoInterruptedMetadataExchanges` does, when the files of an exchange recorded in `metadata_dir` hold
+/// contents it did not record. Otherwise throws `INCORRECT_FILE_NAME` when such an exchange would need an undo. Changes no file.
 void checkNoMetadataExchangeToUndo(const DiskPtr & disk, const String & metadata_dir, const LoggerPtr & log);
 
 }
