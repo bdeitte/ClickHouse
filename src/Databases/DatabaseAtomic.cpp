@@ -476,6 +476,12 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
                 record.old_path_content = readMetadataFile(db_disk, new_metadata_path);
                 record.new_path_content = readMetadataFile(db_disk, old_metadata_path);
                 const bool fsync = local_context->getSettingsRef()[Setting::fsync_metadata];
+                /// Once per database, so that frequent refreshes do not repeat it.
+                if (!fsync && !warned_about_exchange_without_fsync.exchange(true, std::memory_order_relaxed))
+                    LOG_WARNING(log, "The exchange of {} and {} runs without `fsync_metadata`. If the server crashes after such an "
+                        "exchange succeeds, the removal of its record may be lost, and the next load then undoes the exchange, which "
+                        "puts the two tables back under their names from before it. This warning is logged once for database {}",
+                        old_metadata_path, new_metadata_path, backQuote(database_name));
                 try
                 {
                     exchangeMetadataFilesWithRecord(table_name, to_table_name, db_disk, record, fsync);
@@ -1649,6 +1655,10 @@ loads, it undoes every swap whose record is left, whether or not the setting is 
 before the swap, and each table keeps the name the server served it with. The replacement table of `CREATE OR REPLACE` or
 `REPLACE TABLE` stays under its `_tmp_replace_*` name. Run the statement again, and then drop that table.
 
+This holds only with `fsync_metadata`, which is on by default. Without it, a crash right after a swap that succeeded can lose the
+removal of its record, and the load then undoes that swap, so the two tables go back to their names from before it. The server logs
+a warning the first time a database swaps without `fsync_metadata`.
+
 If a file holds neither of the recorded contents, the load fails with `CORRUPTED_DATA` and leaves the files as they are. At server
 start, the server then does not start until the files are repaired by hand, as the error describes.
 
@@ -1689,6 +1699,11 @@ Before a downgrade to a version before 26.11, start the server once after a cras
 the swap. A version before 26.11 does not start while a database has a leftover `<table>.sql.tmp_exchange` file, because its load
 fails with `INCORRECT_FILE_NAME`. It ignores a leftover record without that file, and loads the two files as they are, which can be
 the contents from after a swap that the last server did not apply.
+
+If a version before 26.11 ran while a record was left, remove the leftover records `.<table>.sql.exchange` before upgrading again.
+The older version served the two files as they were, and the record does not show that. So the load of the newer version would undo
+the swap and put the two tables back under their old names, or, if DDL on the older version changed or removed either file, fail
+with `CORRUPTED_DATA`, and the server would not start until the files are repaired by hand.
 
 ### Limiting the number of tables {#limiting-the-number-of-tables}
 

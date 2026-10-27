@@ -199,6 +199,9 @@ private:
     /// `unfinished_exchanges` under `mutex`, and a load ordered after a store sees it whatever its memory order, so
     /// `std::memory_order_relaxed` is enough.
     std::atomic<bool> has_unfinished_exchange{false};
+
+    /// Whether an exchange with a record without `fsync_metadata` has logged its warning, which is logged once per database.
+    std::atomic<bool> warned_about_exchange_without_fsync{false};
 };
 
 }

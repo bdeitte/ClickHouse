@@ -350,6 +350,8 @@ void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metad
         /// was fenced, the server served the two tables under their old names until the restart, and inserts reached them there.
         /// So the exchange is undone, not finished, which keeps each table under the name the server served it with. That holds
         /// with or without the temporary file: the moves or a finish may have completed before the crash or the fence.
+        /// This needs `fsync_metadata`. Without it, a crash can lose the removal of the record of an exchange that succeeded,
+        /// and this undoes that exchange. `DatabaseAtomic::renameTable` warns about such an exchange.
         switch (inspectMetadataExchange(disk, *record))
         {
             case MetadataExchangeState::BeforeExchange:
