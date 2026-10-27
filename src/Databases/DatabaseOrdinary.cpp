@@ -418,7 +418,7 @@ void DatabaseOrdinary::loadTablesMetadata(ContextPtr local_context, ParsedTables
                 {
                     /// A bit tricky way to distinguish ATTACH DATABASE and server startup (actually it's "force_attach" flag).
                     /// When attaching a database with a read-only disk, the UUIDs do not exist, we add them manually.
-                    if (is_startup || (db_disk->isReadOnly() && !DatabaseCatalog::instance().hasUUIDMapping(create_query->uuid)))
+                    if (is_startup || (isMetadataDiskReadOnlyAtLoad(db_disk) && !DatabaseCatalog::instance().hasUUIDMapping(create_query->uuid)))
                     {
                         /// Server is starting up. Lock UUID used by permanently detached table.
                         DatabaseCatalog::instance().addUUIDMapping(create_query->uuid);
@@ -542,7 +542,7 @@ void DatabaseOrdinary::loadTablesMetadata(ContextPtr local_context, ParsedTables
         LOG_WARNING(log, "Metadata file {} refers to the same table (UUID {}) as {}, which is a leftover of an interrupted rename"
             " of a temporary table of `CREATE OR REPLACE`. Removing it.",
             full_path, create_query->uuid, *duplicate_of_path);
-        if (!db_disk->isReadOnly())
+        if (!isMetadataDiskReadOnlyAtLoad(db_disk))
             db_disk->removeFile(full_path);
     }
 

@@ -842,7 +842,7 @@ bool DatabaseAtomic::undoInterruptedMetadataExchangesAtLoad() const
     if (!canEmulateExchange(db_disk))
         return false;
     /// The load cannot undo a swap on a read-only disk, so it refuses the files of a swap that the server did not apply.
-    if (db_disk->isReadOnly())
+    if (isMetadataDiskReadOnlyAtLoad(db_disk))
     {
         checkNoMetadataExchangeToUndo(db_disk, getMetadataPath(), log);
         return false;

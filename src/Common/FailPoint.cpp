@@ -174,6 +174,7 @@ static struct InitFiu
     ONCE(database_atomic_exchange_fail_to_sync_removed_record) \
     PAUSEABLE_ONCE(database_atomic_exchange_pause_after_second_move) \
     PAUSEABLE_ONCE(database_atomic_pause_before_reading_create_query) \
+    REGULAR(database_atomic_load_metadata_disk_read_only) \
     REGULAR(dummy_failpoint) \
     ONCE(system_log_pipeline_fail_after_smt_restore) \
     REGULAR(prefetched_reader_pool_failpoint) \

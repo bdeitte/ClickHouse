@@ -127,6 +127,11 @@ protected:
     /// before any metadata file is processed. Returns whether it undid the swaps, so that the files are listed again.
     virtual bool undoInterruptedMetadataExchangesAtLoad() const { return false; }
 
+    /// Whether the load of the database treats its metadata disk `disk` as read-only: the disk is read-only, or a test made the load
+    /// treat it so with the failpoint `database_atomic_load_metadata_disk_read_only`. Every branch of the load that depends on a
+    /// read-only metadata disk calls it, so that the failpoint gives the behavior of a read-only disk.
+    static bool isMetadataDiskReadOnlyAtLoad(const DiskPtr & disk);
+
     ASTPtr getCreateDatabaseQueryImpl() const override TSA_REQUIRES(mutex);
     ASTPtr getCreateTableQueryImpl(
         const String & table_name,

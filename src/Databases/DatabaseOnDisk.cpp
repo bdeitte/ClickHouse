@@ -42,6 +42,7 @@
 #include <Common/Exception.h>
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/ErrnoException.h>
+#include <Common/FailPoint.h>
 #include <Common/assert_cast.h>
 #include <Common/computeMaxTableNameLength.h>
 #include <Common/escapeForFileName.h>
@@ -71,6 +72,11 @@ namespace Setting
     extern const SettingsSeconds lock_acquire_timeout;
     extern const SettingsUInt64 max_parser_backtracks;
     extern const SettingsUInt64 max_parser_depth;
+}
+
+namespace FailPoints
+{
+    extern const char database_atomic_load_metadata_disk_read_only[];
 }
 
 namespace ErrorCodes
@@ -772,6 +778,15 @@ time_t DatabaseOnDisk::getObjectMetadataModificationTime(const String & object_n
     }
 }
 
+bool DatabaseOnDisk::isMetadataDiskReadOnlyAtLoad(const DiskPtr & disk)
+{
+    /// Lets a test load a database as from a read-only disk: `clickhouse-local` skips the access check of disks, which is what
+    /// marks a local disk read-only, and a test running as root cannot make a directory read-only.
+    bool read_only = disk->isReadOnly();
+    fiu_do_on(FailPoints::database_atomic_load_metadata_disk_read_only, { read_only = true; });
+    return read_only;
+}
+
 void DatabaseOnDisk::iterateMetadataFiles(const IteratingFunction & process_metadata_file) const
 {
     auto db_disk = getDisk();
@@ -926,7 +941,7 @@ void DatabaseOnDisk::iterateMetadataFiles(const IteratingFunction & process_meta
                 continue;
 
             stale_files.insert(file_name);
-            if (db_disk->isReadOnly())
+            if (isMetadataDiskReadOnlyAtLoad(db_disk))
             {
                 LOG_WARNING(log, "Skipping {}: it is a copy of {}", path, *copy);
                 continue;
