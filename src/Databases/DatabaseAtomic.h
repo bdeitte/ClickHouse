@@ -158,7 +158,8 @@ private:
 
     /// Fences an exchange that failed and could not be finished: adds `table_name` and `other_table_name` to `unfinished_exchanges`,
     /// then rethrows `error`. `hint` tells what the restart does about the metadata files `files` and where the rows inserted
-    /// until then end up. This function adds what the fence refuses and accepts until then, and adds the result to `error`.
+    /// until then end up. This function adds what the fence refuses and accepts until then, and adds the result to `error` and to
+    /// the error it logs. The queries that the fence refuses later get a short error that refers to these two.
     [[noreturn]] void fenceUnfinishedExchange(
         const String & table_name,
         const String & other_table_name,
@@ -175,20 +176,12 @@ private:
     /// Throws `UNFINISHED_METADATA_EXCHANGE` while an exchange of the metadata file of `table_name` could not be finished.
     void assertTableHasNoUnfinishedExchangeUnlocked(const String & table_name) const TSA_REQUIRES(mutex);
 
-    struct UnfinishedExchange
-    {
-        /// The two metadata files of the exchange.
-        String files;
-        /// What the restart does about the exchange and where the rows inserted until then end up, for the errors until then.
-        String hint;
-    };
-
     /// Set when an exchange of two metadata files with a record failed and could not be finished, so the files of its two tables
-    /// may be half exchanged. By table name. Until the server restarts, DDL on the two tables and reads of their definitions fail,
+    /// may be half exchanged. By table name, the two metadata files of the exchange, for the errors. Until the server restarts, DDL on the two tables and reads of their definitions fail,
     /// and so do `DROP DATABASE`, `DETACH DATABASE` and `TRUNCATE DATABASE`. The record of the exchange is left, and the next load
     /// undoes the exchange from it, or reports `CORRUPTED_DATA` when the files hold none of the recorded contents. Inserts are not
     /// refused: until the restart, they reach the tables as they were before the exchange.
-    std::map<String, UnfinishedExchange> unfinished_exchanges TSA_GUARDED_BY(mutex);
+    std::map<String, String> unfinished_exchanges TSA_GUARDED_BY(mutex);
 
     /// Whether `unfinished_exchanges` is not empty. Set by `fenceUnfinishedExchange` and never cleared, like the fence. While it is
     /// `false`, `readCreateQueryFromMetadataFile`, `getTablesForBackup` and `checkNoUnfinishedExchange` for a table do not lock

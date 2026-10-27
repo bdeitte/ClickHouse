@@ -80,8 +80,8 @@ local_query 1 "
     DROP DATABASE d; -- { serverError UNFINISHED_METADATA_EXCHANGE }
     DETACH DATABASE d; -- { serverError UNFINISHED_METADATA_EXCHANGE }
     TRUNCATE DATABASE d; -- { serverError UNFINISHED_METADATA_EXCHANGE }
-    SELECT 'the error of the fence says what the restart does: '
-        || toString(last_error_message LIKE '%until the server restarts%the next load undoes the exchange%')
+    SELECT 'the error of the fence refers to the error of the swap: '
+        || toString(last_error_message LIKE '%until the server restarts%The error of the query that ran the exchange%')
     FROM system.errors WHERE name = 'UNFINISHED_METADATA_EXCHANGE';
     -- The definitions of the two tables cannot be read.
     SELECT 'unreadable definitions: ' || toString(count()) FROM system.tables
@@ -109,7 +109,7 @@ local_query 1 "
 " --ignore-error 2>"$ERRORS"
 echo "errors without an expected code: $(grep -c '^Code: ' "$ERRORS")"
 echo "the error of the swap is FAULT_INJECTED: $(grep -c 'FAULT_INJECTED' "$ERRORS")"
-echo "the error of the swap says what the restart does: $(grep -c 'until the server restarts' "$ERRORS")"
+echo "the error of the swap says what the restart does: $(grep -c 'until the server restarts.*the next load undoes the exchange' "$ERRORS")"
 # Each of the two swaps stopped after its first move, and left its temporary file and its record.
 print_swap_files "$DIR"
 

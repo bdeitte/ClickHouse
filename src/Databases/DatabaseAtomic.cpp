@@ -98,6 +98,12 @@ constexpr std::string_view pause_before_reading_create_query_query_id_prefix = "
 /// so that the swaps of other queries and of refreshes do not take the pause meant for a test.
 constexpr std::string_view pause_after_second_move_query_id_prefix = "atomic_exchange_pause_after_second_move_";
 
+/// Ends the errors of the queries that a fence refuses. Only the error of the query that ran the exchange and the server log
+/// have the full text of what the restart does, so that every refused query does not repeat it.
+constexpr auto unfinished_exchange_details
+    = "The error of the query that ran the exchange, and the error about it in the server log, say what the restart does "
+      "with the two files and where the rows inserted until then end up";
+
 }
 
 class AtomicDatabaseTablesSnapshotIterator final : public DatabaseTablesSnapshotIterator
@@ -775,11 +781,11 @@ void DatabaseAtomic::checkNoUnfinishedExchange(const String & table_name) const
     }
     if (!unfinished_exchanges.empty())
     {
-        const auto & [_, exchange] = *unfinished_exchanges.begin();
+        const auto & [_, files] = *unfinished_exchanges.begin();
         throw Exception(ErrorCodes::UNFINISHED_METADATA_EXCHANGE,
                         "An exchange of {} in database {} failed and could not be finished, so the database cannot be dropped, "
                         "detached or truncated until the server restarts. {}",
-                        exchange.files, backQuote(database_name), exchange.hint);
+                        files, backQuote(database_name), unfinished_exchange_details);
     }
 }
 
@@ -810,7 +816,7 @@ void DatabaseAtomic::assertTableHasNoUnfinishedExchangeUnlocked(const String & t
         throw Exception(ErrorCodes::UNFINISHED_METADATA_EXCHANGE,
                         "An exchange of {} failed and could not be finished, so DDL on table {}.{} and reads of its definition "
                         "fail until the server restarts. {}",
-                        it->second.files, backQuote(database_name), backQuote(table_name), it->second.hint);
+                        it->second, backQuote(database_name), backQuote(table_name), unfinished_exchange_details);
 }
 
 String DatabaseAtomic::readObjectMetadataFile(const String & object_name) const
@@ -1027,7 +1033,7 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
                 case MetadataExchangeState::Interrupted:
                     fiu_do_on(FailPoints::database_atomic_exchange_fail_to_finish,
                         { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault before finishing an exchange"); });
-                    finishMetadataExchange(disk, record, fsync);
+                    finishMetadataExchange(disk, record, fsync, log);
                     /// As when the removal of the temporary file at the end of the finish reports an error after it succeeded.
                     fiu_do_on(FailPoints::database_atomic_exchange_fail_after_finish,
                         { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after finishing an exchange"); });
@@ -1128,9 +1134,8 @@ void DatabaseAtomic::fenceUnfinishedExchange(
     hint += ". If the exchange was done by a refresh of a materialized view, the first refresh after the restart replaces the "
         "leftover `.tmp` table. A `ReplicatedMergeTree` table among the two cannot apply `ALTER` entries until the restart";
 
-    const UnfinishedExchange unfinished{files, hint};
-    unfinished_exchanges[table_name] = unfinished;
-    unfinished_exchanges[other_table_name] = unfinished;
+    unfinished_exchanges[table_name] = files;
+    unfinished_exchanges[other_table_name] = files;
     has_unfinished_exchange.store(true, std::memory_order_relaxed);
 
     LOG_ERROR(log, "Cannot finish the exchange of {} after an error: {}. DDL on the two tables and reads of their definitions "
@@ -1631,10 +1636,59 @@ Amazon EFS, does not support that call, so these statements fail with `UNSUPPORT
 
 With the experimental server setting [`database_atomic_allow_exchange_emulation`](/reference/settings/server-settings/settings/other#database_atomic_allow_exchange_emulation),
 `CREATE OR REPLACE`, `REPLACE TABLE` and refreshes work on NFS when the metadata is on a `local` disk. The swap first writes a record
-of both files, then moves the files one at a time and removes the record, so the next load of the database undoes a swap that
-a crash interrupted before the swap removed its record.
+`.<table>.sql.exchange` with both paths and the content each path has after the swap. It then renames `<table>.sql` to
+`<table>.sql.tmp_exchange`, the other file to `<table>.sql`, and the temporary file to the other name, and removes the record.
+The tables take their new names in memory only after the record is removed.
 `EXCHANGE TABLES`, `EXCHANGE DICTIONARIES`, exchanges between two databases and `Replicated` databases still fail on NFS.
-The description of the setting explains what happens when a swap fails and cannot be finished.
+
+#### Loading a database with a leftover record {#metadata-on-nfs-load}
+
+A record is left only when the query that ran the swap did not succeed: the server crashed during the swap, or the swap failed
+and was fenced, as described below. Until then, the server served both tables under their old names. So when an `Atomic` database
+loads, it undoes every swap whose record is left, whether or not the setting is on: it restores both files to their contents from
+before the swap, and each table keeps the name the server served it with. The replacement table of `CREATE OR REPLACE` or
+`REPLACE TABLE` stays under its `_tmp_replace_*` name. Run the statement again, and then drop that table.
+
+If a file holds neither of the recorded contents, the load fails with `CORRUPTED_DATA` and leaves the files as they are. At server
+start, the server then does not start until the files are repaired by hand, as the error describes.
+
+When the metadata disk is read-only, the load cannot undo a swap. It fails with `INCORRECT_FILE_NAME` unless both files still hold
+their contents from before the swap, and the error says to load the database once from a writable disk. When a file holds neither
+of the recorded contents, it fails with `CORRUPTED_DATA`, as on a writable disk.
+
+#### A swap that cannot be finished {#metadata-on-nfs-unfinished-swap}
+
+A rename on NFS can report an error after it succeeded, so after a failed rename the state of the files decides what happens.
+If no file changed, the renames are tried once more. A swap that a rename interrupted is finished from the record, and a swap
+whose renames completed is accepted. In every other case, and when the swap cannot remove its record, the swap leaves its record
+and fences its two tables until the server restarts:
+
+- DDL on the two tables, reads of their definitions and `BACKUP` of them fail with `UNFINISHED_METADATA_EXCHANGE`.
+- `DROP DATABASE`, `DETACH DATABASE` and `TRUNCATE DATABASE` of their database fail with the same error. They stop the refreshes
+  of the refreshable materialized views of the database that are not `APPEND` before their last check, so when that check refuses
+  them, these views stay stopped until the restart. Only a restart clears the fence.
+- Inserts and selects keep working on the tables as they were before the swap.
+- A `ReplicatedMergeTree` table among the two cannot apply `ALTER` entries from its replication queue.
+- `system.warnings` has an entry about the last such swap.
+
+The error of the query that ran the swap, and an error in the server log, say what the restart does with the files. The restart
+undoes the swap from the record, as described above, so the rows inserted until then stay in their tables.
+
+The restart can keep the files exchanged in one case: the renames completed, but the server cannot tell whether the record will
+be there at the restart, because the removal of the record failed and the record could not be looked up, or because the removal
+could not be made durable. The errors of the swap say so. If the restart does not find the record, rows inserted into the replaced
+table until the restart are in the `_tmp_replace_*` table of `CREATE OR REPLACE` or `REPLACE TABLE`, or in the `.tmp` table of a
+refresh. Check a `_tmp_replace_*` table for them before dropping it. The first refresh after the restart replaces the `.tmp` table,
+so to check it first, start the server with `stop_refreshable_materialized_views_on_startup` enabled in the default profile, which
+keeps the refreshes stopped until `SYSTEM START VIEW`. After the check, start the views with `SYSTEM START VIEW` and remove the
+setting from the default profile again, because it stops the refreshes of every refreshable materialized view at each start.
+
+#### Downgrade {#metadata-on-nfs-downgrade}
+
+Before a downgrade to a version before 26.11, start the server once after a crash or after a fenced swap, so that the load undoes
+the swap. A version before 26.11 does not start while a database has a leftover `<table>.sql.tmp_exchange` file, because its load
+fails with `INCORRECT_FILE_NAME`. It ignores a leftover record without that file, and loads the two files as they are, which can be
+the contents from after a swap that the last server did not apply.
 
 ### Limiting the number of tables {#limiting-the-number-of-tables}
 

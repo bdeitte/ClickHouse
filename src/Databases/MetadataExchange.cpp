@@ -66,12 +66,19 @@ void replaceMetadataFile(const DiskPtr & disk, const String & path, const String
 /// Writes `old_path_content` to the file `record.old_path` and `new_path_content` to `record.new_path`,
 /// then removes the temporary file of the exchange.
 void writeMetadataExchangeFiles(
-    const DiskPtr & disk, const MetadataExchangeRecord & record, const String & old_path_content, const String & new_path_content, bool fsync)
+    const DiskPtr & disk,
+    const MetadataExchangeRecord & record,
+    const String & old_path_content,
+    const String & new_path_content,
+    bool fsync,
+    const LoggerPtr & log)
 {
     replaceMetadataFile(disk, record.old_path, old_path_content, fsync);
     replaceMetadataFile(disk, record.new_path, new_path_content, fsync);
     /// Last, so that a crash before it leaves the exchange `Interrupted`, and the next load undoes it.
-    disk->removeFileIfExists(metadataExchangeTmpPath(record.old_path));
+    const String tmp_path = metadataExchangeTmpPath(record.old_path);
+    LOG_INFO(log, "Removing file {}", tmp_path);
+    disk->removeFileIfExists(tmp_path);
 }
 
 }
@@ -194,12 +201,12 @@ MetadataExchangeState inspectMetadataExchange(const DiskPtr & disk, const Metada
     return MetadataExchangeState::Inconsistent;
 }
 
-void finishMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync)
+void finishMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync, const LoggerPtr & log)
 {
-    writeMetadataExchangeFiles(disk, record, record.old_path_content, record.new_path_content, fsync);
+    writeMetadataExchangeFiles(disk, record, record.old_path_content, record.new_path_content, fsync, log);
 }
 
-void undoMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync)
+void undoMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync, const LoggerPtr & log)
 {
     /// Without the temporary file, the writes below pass through a state where both files hold the same content, which a crash
     /// would leave `Inconsistent`. The temporary file, with the content it has during the exchange, keeps every state until the
@@ -211,7 +218,7 @@ void undoMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & r
         writeMetadataFile(disk, write_path, record.new_path_content, fsync);
         disk->replaceFile(write_path, tmp_path);
     }
-    writeMetadataExchangeFiles(disk, record, record.new_path_content, record.old_path_content, fsync);
+    writeMetadataExchangeFiles(disk, record, record.new_path_content, record.old_path_content, fsync, log);
 }
 
 namespace
@@ -349,7 +356,7 @@ void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metad
                 break;
             case MetadataExchangeState::Interrupted:
             case MetadataExchangeState::AfterExchange:
-                undoMetadataExchange(disk, *record, fsync);
+                undoMetadataExchange(disk, *record, fsync, log);
                 /// Durable before the record is removed below. Otherwise a crash could keep the removal and lose the undo.
                 if (fsync)
                     syncMetadataExchangeDirectory(disk, record_path);

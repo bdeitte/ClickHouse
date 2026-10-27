@@ -69,14 +69,14 @@ enum class MetadataExchangeState : uint8_t
 
 MetadataExchangeState inspectMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record);
 
-/// Writes each recorded content to `dir/.<file>.exchange_write` and puts it in place with `replaceFile`, then removes the temporary file.
-/// For an exchange that a move interrupted with an error, after which the server applies the exchange in memory.
-void finishMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync);
+/// Writes each recorded content to `dir/.<file>.exchange_write` and puts it in place with `replaceFile`, then removes the temporary file,
+/// which it logs to `log`. For an exchange that a move interrupted with an error, after which the server applies the exchange in memory.
+void finishMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync, const LoggerPtr & log);
 
 /// Like `finishMetadataExchange`, but writes the contents from before the exchange: `new_path_content` to `old_path`,
 /// and `old_path_content` to `new_path`. Without the temporary file, it first writes the temporary file, so that a crash
 /// during the undo leaves the exchange `Interrupted`.
-void undoMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync);
+void undoMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync, const LoggerPtr & log);
 
 /// Called when a database on `disk` is loaded. Removes leftover temporary records and writes of a finish or an undo in
 /// `metadata_dir`, undoes the exchanges recorded there whose files are not as before them, and removes their records.

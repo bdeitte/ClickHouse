@@ -18,6 +18,7 @@ UUID="5458a70c-0000-4000-8000-000000000001"
 # The database of the swap whose record may be gone at the restart, separate so that its temporary table is told apart.
 OTHER_UUID="5458a70c-0000-4000-8000-000000000002"
 DIR="${LOCAL_PATH}/store/${UUID:0:3}/${UUID}"
+ERRORS="${CLICKHOUSE_TMP}/${CLICKHOUSE_TEST_UNIQUE_NAME}_errors"
 OTHER_DIR="${LOCAL_PATH}/store/${OTHER_UUID:0:3}/${OTHER_UUID}"
 if [ -z "$CLICKHOUSE_TMP" ] || [ -z "$CLICKHOUSE_TEST_UNIQUE_NAME" ] \
     || [[ "$DIR" != "$CLICKHOUSE_TMP"/*/store/* ]] || [[ "$OTHER_DIR" != "$CLICKHOUSE_TMP"/*/store/* ]]
@@ -26,10 +27,11 @@ then
     exit 1
 fi
 
-# Runs the queries $2 in a start with the server setting `database_atomic_allow_exchange_emulation` set to $1.
+# Runs the queries $2 in a start with the server setting `database_atomic_allow_exchange_emulation` set to $1,
+# and the other arguments of `clickhouse-local` after $2.
 function local_query()
 {
-    $CLICKHOUSE_LOCAL --path "$LOCAL_PATH" -q "$2" -- --database_atomic_allow_exchange_emulation="$1"
+    $CLICKHOUSE_LOCAL --path "$LOCAL_PATH" "${@:3}" -q "$2" -- --database_atomic_allow_exchange_emulation="$1"
 }
 
 # Prints the number of dot-files, such as records of swaps, and of temporary files of swaps in the metadata directory $1.
@@ -42,6 +44,8 @@ function print_swap_files()
 }
 
 echo "the start that fences"
+# Only the error of the swap says what the restart does, and the swaps that fence have no expected error, so that
+# `--ignore-error` keeps going after them and their errors are checked below.
 local_query 1 "
     CREATE DATABASE d UUID '$UUID' ENGINE = Atomic;
     CREATE TABLE d.t1 (x UInt8) ENGINE = MergeTree ORDER BY x;
@@ -58,31 +62,26 @@ local_query 1 "
     -- of the temporary file reports an error after it succeeded, fences the swap without the temporary file.
     SYSTEM ENABLE FAILPOINT database_atomic_exchange_fail_after_first_move;
     SYSTEM ENABLE FAILPOINT database_atomic_exchange_fail_after_finish;
-    CREATE OR REPLACE TABLE d.t1 (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x AS SELECT 2, 3; -- { serverError FAULT_INJECTED }
+    CREATE OR REPLACE TABLE d.t1 (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x AS SELECT 2, 3;
     INSERT INTO d.t1 VALUES (5);
     ALTER TABLE d.t1 ADD COLUMN z UInt8; -- { serverError UNFINISHED_METADATA_EXCHANGE }
-    SELECT 't1: the error says what the restart does: '
-        || toString(last_error_message LIKE '%The record % is left, so the next load undoes the exchange%')
-    FROM system.errors WHERE name = 'UNFINISHED_METADATA_EXCHANGE';
 
     -- The moves complete, but the record cannot be removed.
     SYSTEM ENABLE FAILPOINT database_atomic_exchange_fail_to_remove_record;
-    CREATE OR REPLACE TABLE d.t2 (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x AS SELECT 2, 3; -- { serverError FAULT_INJECTED }
+    CREATE OR REPLACE TABLE d.t2 (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x AS SELECT 2, 3;
     INSERT INTO d.t2 VALUES (5);
     ALTER TABLE d.t2 ADD COLUMN z UInt8; -- { serverError UNFINISHED_METADATA_EXCHANGE }
-    SELECT 't2: the error says what the restart does: '
-        || toString(last_error_message LIKE '%The two files were exchanged, but their record % could not be removed, so the next load undoes the exchange%')
-    FROM system.errors WHERE name = 'UNFINISHED_METADATA_EXCHANGE';
 
     -- The moves fail twice, so the swap fails without a change to the files, but the record cannot be removed either.
     SYSTEM ENABLE FAILPOINT database_atomic_exchange_always_fail_before_first_move;
-    CREATE OR REPLACE TABLE d.t3 (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x AS SELECT 2, 3; -- { serverError FAULT_INJECTED }
+    CREATE OR REPLACE TABLE d.t3 (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x AS SELECT 2, 3;
     SYSTEM DISABLE FAILPOINT database_atomic_exchange_always_fail_before_first_move;
     SYSTEM DISABLE FAILPOINT database_atomic_exchange_fail_to_remove_record;
     INSERT INTO d.t3 VALUES (5);
     ALTER TABLE d.t3 ADD COLUMN z UInt8; -- { serverError UNFINISHED_METADATA_EXCHANGE }
-    SELECT 't3: the error says what the restart does: '
-        || toString(last_error_message LIKE '%The two files were not exchanged, but their record % could not be removed, so the next load undoes the exchange%')
+    -- The error of a query that the fence refuses refers to the error of the swap.
+    SELECT 'the error of the fence refers to the error of the swap: '
+        || toString(last_error_message LIKE '%until the server restarts%The error of the query that ran the exchange%')
     FROM system.errors WHERE name = 'UNFINISHED_METADATA_EXCHANGE';
 
     -- The write of the record fails after the record is in place. The swap removes the record, so it fails without a fence.
@@ -98,13 +97,16 @@ local_query 1 "
     CREATE TABLE e.t5 (x UInt8) ENGINE = MergeTree ORDER BY x;
     INSERT INTO e.t5 VALUES (1);
     SYSTEM ENABLE FAILPOINT database_atomic_exchange_fail_to_sync_removed_record;
-    CREATE OR REPLACE TABLE e.t5 (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x AS SELECT 2, 3; -- { serverError FAULT_INJECTED }
+    CREATE OR REPLACE TABLE e.t5 (x UInt8, y UInt8) ENGINE = MergeTree ORDER BY x AS SELECT 2, 3;
     INSERT INTO e.t5 VALUES (5);
     ALTER TABLE e.t5 ADD COLUMN z UInt8; -- { serverError UNFINISHED_METADATA_EXCHANGE }
-    SELECT 't5: the error says what the restart does: '
-        || toString(last_error_message LIKE '%it is not known whether their record % is there at the restart%If it is not, the next load keeps the two files exchanged%')
-    FROM system.errors WHERE name = 'UNFINISHED_METADATA_EXCHANGE';
-"
+" --ignore-error 2>"$ERRORS"
+echo "errors without an expected code: $(grep -c '^Code: ' "$ERRORS")"
+echo "the errors of the swaps are FAULT_INJECTED: $(grep -c 'FAULT_INJECTED' "$ERRORS")"
+echo "t1: the error of the swap says what the restart does: $(grep -c 'The record .* is left, so the next load undoes the exchange' "$ERRORS")"
+echo "t2: the error of the swap says what the restart does: $(grep -c 'The two files were exchanged, but their record .* could not be removed, so the next load undoes the exchange' "$ERRORS")"
+echo "t3: the error of the swap says what the restart does: $(grep -c 'The two files were not exchanged, but their record .* could not be removed, so the next load undoes the exchange' "$ERRORS")"
+echo "t5: the error of the swap says what the restart does: $(grep -c 'it is not known whether their record .* is there at the restart.*If it is not, the next load keeps the two files exchanged' "$ERRORS")"
 # The three fenced swaps of `d` left their records, and none left a temporary file. The swap of `e` removed its record.
 print_swap_files "$DIR"
 print_swap_files "$OTHER_DIR"

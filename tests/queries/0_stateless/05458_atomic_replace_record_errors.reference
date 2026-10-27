@@ -1,9 +1,12 @@
 the start that fences
-t1: the error says what the restart does: 1
-t2: the error says what the restart does: 1
-t3: the error says what the restart does: 1
+the error of the fence refers to the error of the swap: 1
 t4 is not fenced
-t5: the error says what the restart does: 1
+errors without an expected code: 4
+the errors of the swaps are FAULT_INJECTED: 4
+t1: the error of the swap says what the restart does: 1
+t2: the error of the swap says what the restart does: 1
+t3: the error of the swap says what the restart does: 1
+t5: the error of the swap says what the restart does: 1
 dot-files: 3
 temporary files: 0
 dot-files: 0
