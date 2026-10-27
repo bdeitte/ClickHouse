@@ -51,9 +51,26 @@ CREATE OR REPLACE DICTIONARY
 dot-files: 0
 other files: 0
 swaps with a record: 1
+REPLACE DICTIONARY
+1	old
+dot-files: 0
+other files: 0
+swaps with a record: 1
 refreshable materialized view with an inner table
 1
 2
+dot-files: 0
+other files: 0
+swaps with a record: 1
+refresh that finds a leftover .tmp table
+1
+2
+.tmp tables: 0
+dot-files: 0
+other files: 0
+swaps with a record: 2
+CREATE OR REPLACE MATERIALIZED VIEW
+12
 dot-files: 0
 other files: 0
 swaps with a record: 1

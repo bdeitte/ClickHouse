@@ -201,6 +201,15 @@ $CLICKHOUSE_CLIENT -q "SELECT * FROM $DB.d"
 print_leftover_files "$DIR"
 print_record_used "$DB" "$since"
 
+echo "REPLACE DICTIONARY"
+since=$(now_us)
+$CLICKHOUSE_CLIENT -q "
+    REPLACE DICTIONARY $DB.d (k UInt64, s String) PRIMARY KEY k
+        SOURCE(CLICKHOUSE(DB '$DB' TABLE 'dict_source_old')) LAYOUT(HASHED()) LIFETIME(0)"
+$CLICKHOUSE_CLIENT -q "SELECT * FROM $DB.d"
+print_leftover_files "$DIR"
+print_record_used "$DB" "$since"
+
 echo "refreshable materialized view with an inner table"
 $CLICKHOUSE_CLIENT -q "
     CREATE TABLE $DB.src (x UInt8) ENGINE = MergeTree ORDER BY x;
@@ -215,6 +224,40 @@ $CLICKHOUSE_CLIENT -q "
     SYSTEM WAIT VIEW $DB.mv;
 "
 $CLICKHOUSE_CLIENT -q "SELECT * FROM $DB.mv ORDER BY x"
+print_leftover_files "$DIR"
+print_record_used "$DB" "$since"
+
+# A refresh creates its `.tmp` table with `CREATE OR REPLACE`, which swaps when a crash or a failed refresh left that
+# table behind. The leftover is made by hand under the name the refresh uses, so the refresh swaps twice.
+echo "refresh that finds a leftover .tmp table"
+MV_UUID=$($CLICKHOUSE_CLIENT -q "SELECT uuid FROM system.tables WHERE database = '$DB' AND name = 'mv'")
+$CLICKHOUSE_CLIENT -q "
+    CREATE TABLE $DB.\`.tmp.inner_id.$MV_UUID\` (x UInt8) ENGINE = MergeTree ORDER BY x;
+    INSERT INTO $DB.\`.tmp.inner_id.$MV_UUID\` VALUES (99);
+"
+since=$(now_us)
+$CLICKHOUSE_CLIENT -q "
+    SYSTEM REFRESH VIEW $DB.mv;
+    SYSTEM WAIT VIEW $DB.mv;
+"
+$CLICKHOUSE_CLIENT -q "SELECT * FROM $DB.mv ORDER BY x"
+$CLICKHOUSE_CLIENT -q "
+    SELECT '.tmp tables: ' || toString(count())
+    FROM system.tables WHERE database = '$DB' AND startsWith(name, '.tmp')"
+print_leftover_files "$DIR"
+print_record_used "$DB" "$since"
+
+echo "CREATE OR REPLACE MATERIALIZED VIEW"
+$CLICKHOUSE_CLIENT -q "
+    CREATE TABLE $DB.src_plain (x UInt8) ENGINE = MergeTree ORDER BY x;
+    CREATE MATERIALIZED VIEW $DB.mv_plain ENGINE = MergeTree ORDER BY x AS SELECT x FROM $DB.src_plain;
+    INSERT INTO $DB.src_plain VALUES (1);
+"
+since=$(now_us)
+$CLICKHOUSE_CLIENT -q "CREATE OR REPLACE MATERIALIZED VIEW $DB.mv_plain ENGINE = MergeTree ORDER BY x AS SELECT x + 10 AS x FROM $DB.src_plain"
+$CLICKHOUSE_CLIENT -q "INSERT INTO $DB.src_plain VALUES (2)"
+# Only the replacement view, with its new inner table, has seen the insert after the swap.
+$CLICKHOUSE_CLIENT -q "SELECT * FROM $DB.mv_plain ORDER BY x"
 print_leftover_files "$DIR"
 print_record_used "$DB" "$since"
 
