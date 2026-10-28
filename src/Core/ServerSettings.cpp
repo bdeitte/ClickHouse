@@ -544,6 +544,13 @@ A value of `0` means all cores.
 The delay during which a dropped table can be restored using the [`UNDROP`](/reference/statements/undrop) statement. If `DROP TABLE` ran with a `SYNC` modifier, the setting is ignored.
 The default for this setting is `480` (8 minutes).
 )", 0) \
+    DECLARE(Bool, database_atomic_allow_exchange_emulation, false, R"(
+When enabled, `Atomic` databases whose metadata is on a `local` disk with a filesystem that cannot exchange two files atomically, such as NFS or Amazon EFS, emulate the swap of two metadata files for `CREATE OR REPLACE`, `REPLACE TABLE` and refreshes of refreshable materialized views that are not `APPEND`. The swap writes a record file `.<table>.sql.exchange`, renames the two files one at a time through a temporary file `<table>.sql.tmp_exchange`, and then removes the record. A load of the database undoes a swap whose record is left, whether or not this setting is on.
+
+`EXCHANGE TABLES`, `EXCHANGE DICTIONARIES`, exchanges between two databases and `Replicated` databases still fail on such a filesystem. With the setting off, `CREATE OR REPLACE`, `REPLACE TABLE` and refreshes fail there with `UNSUPPORTED_METHOD`, and the error mentions this setting.
+
+[Metadata on NFS](/reference/engines/database-engines/atomic#metadata-on-nfs) describes what a load does with a leftover record, what happens when a swap fails and cannot be finished, and what to do before a downgrade.
+)", EXPERIMENTAL) \
     DECLARE(UInt64, database_catalog_unused_dir_hide_timeout_sec, 60 * 60, R"(
 Parameter of a task that cleans up garbage from `store/` directory.
 If some subdirectory is not used by clickhouse-server and this directory was not modified for last

@@ -161,6 +161,12 @@ void DatabaseOverlay::checkDetachedTableNotInUse(const UUID & uuid)
         db->checkDetachedTableNotInUse(uuid);
 }
 
+void DatabaseOverlay::checkNoUnfinishedExchange(const String & table_name) const
+{
+    for (const auto & db : databases)
+        db->checkNoUnfinishedExchange(table_name);
+}
+
 DatabaseDetachedTablesSnapshotIteratorPtr DatabaseOverlay::getDetachedTablesIterator(
     ContextPtr context_, const FilterByNameFunction & filter_by_table_name, bool skip_not_loaded) const
 {
@@ -198,7 +204,8 @@ void DatabaseOverlay::renameTable(
     IDatabase & to_database,
     const String & to_name,
     bool exchange,
-    bool dictionary)
+    bool dictionary,
+    bool allow_exchange_emulation)
 {
     for (auto & db : databases)
     {
@@ -211,12 +218,13 @@ void DatabaseOverlay::renameTable(
                 if (to_overlay_database->databases.empty())
                     throw Exception(ErrorCodes::BAD_ARGUMENTS, "The destination Overlay database {} does not have any members", to_database.getDatabaseName());
 
-                db->renameTable(current_context, name, *to_overlay_database->databases[0], to_name, exchange, dictionary);
+                db->renameTable(
+                    current_context, name, *to_overlay_database->databases[0], to_name, exchange, dictionary, allow_exchange_emulation);
             }
             else
             {
                 /// Renaming into a different type of database. E.g. from Overlay on top of Atomic database into just Atomic database.
-                db->renameTable(current_context, name, to_database, to_name, exchange, dictionary);
+                db->renameTable(current_context, name, to_database, to_name, exchange, dictionary, allow_exchange_emulation);
             }
 
             return;
@@ -235,12 +243,17 @@ ASTPtr DatabaseOverlay::getCreateTableQueryImpl(const String & name, ContextPtr 
             break;
     }
     if (!result && throw_on_error)
+    {
+        /// A member returns nothing for a table whose exchange of metadata files could not be finished,
+        /// so that error is reported instead of a missing table.
+        checkNoUnfinishedExchange(name);
         throw Exception(
             ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY,
             "There is no metadata of table `{}` in database `{}` (engine {})",
             name,
             getDatabaseName(),
             getEngineName());
+    }
     return result;
 }
 

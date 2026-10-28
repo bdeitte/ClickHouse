@@ -179,7 +179,8 @@ BlockIO InterpreterRenameQuery::executeToTables(const ASTRenameQuery & rename, c
                 *database_catalog.getDatabase(elem.to_database_name),
                 elem.to_table_name,
                 exchange_tables,
-                rename.dictionary);
+                rename.dictionary,
+                allow_exchange_emulation);
 
             DatabaseCatalog::instance().addDependencies(to_table_id, from_ref_dependencies, from_loading_dependencies, from_mv_dependencies);
             if (!to_ref_dependencies.empty() || !to_loading_dependencies.empty() || !to_mv_dependencies.empty())

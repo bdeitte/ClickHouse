@@ -130,11 +130,12 @@ public:
     void loadMarkedAsDroppedTables();
 
     /// Get an object that protects the table from concurrently executing multiple DDL operations.
+    /// For a table name, throws `UNFINISHED_METADATA_EXCHANGE` while an exchange of its metadata file could not be finished.
     DDLGuardPtr getDDLGuard(const String & database, const String & table, const IDatabase * expected_database);
 
     /// Guards the storage under its current name, following a concurrent RENAME. Waits without
     /// polling sleeps. Returns nullptr on timeout, when `is_alive()` turns false, or right away
-    /// when an exclusive database DDL holds the database lock.
+    /// when an exclusive database DDL holds the database lock. Throws `UNFINISHED_METADATA_EXCHANGE` like `getDDLGuard`.
     DDLGuardPtr tryGetDDLGuardForStorage(
         const StoragePtr & storage,
         const Poco::Timespan & timeout,
@@ -312,6 +313,9 @@ private:
     /// Always returns a guard, check `ownsTableLock` for the outcome.
     DDLGuardPtr tryGetDDLGuard(
         const String & database, const String & table, const IDatabase * expected_database, std::chrono::milliseconds table_lock_timeout);
+
+    /// Throws while an exchange of the metadata file of `table` could not be finished, see `IDatabase::checkNoUnfinishedExchange`.
+    void checkNoUnfinishedExchange(const String & database, const String & table) const;
 
     void shutdownImpl(std::function<void()> shutdown_system_logs);
 

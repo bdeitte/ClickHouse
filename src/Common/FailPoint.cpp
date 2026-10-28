@@ -161,6 +161,20 @@ static struct InitFiu
     REGULAR(database_catalog_throw_on_table_prepare_shutdown) \
     REGULAR(database_replicated_throw_on_stop_replication) \
     REGULAR(database_catalog_shutdown_sleep_per_table) \
+    REGULAR(database_atomic_exchange_not_supported) \
+    ONCE(database_atomic_exchange_fail_before_first_move) \
+    ONCE(database_atomic_exchange_fail_after_first_move) \
+    ONCE(database_atomic_exchange_fail_after_second_move) \
+    ONCE(database_atomic_exchange_fail_after_third_move) \
+    REGULAR(database_atomic_exchange_always_fail_before_first_move) \
+    REGULAR(database_atomic_exchange_fail_to_finish) \
+    ONCE(database_atomic_exchange_fail_after_finish) \
+    ONCE(database_atomic_exchange_fail_after_writing_record) \
+    REGULAR(database_atomic_exchange_fail_to_remove_record) \
+    ONCE(database_atomic_exchange_fail_to_sync_removed_record) \
+    PAUSEABLE_ONCE(database_atomic_exchange_pause_after_second_move) \
+    PAUSEABLE_ONCE(database_atomic_pause_before_reading_create_query) \
+    REGULAR(database_atomic_load_metadata_disk_read_only) \
     REGULAR(dummy_failpoint) \
     ONCE(system_log_pipeline_fail_after_smt_restore) \
     REGULAR(prefetched_reader_pool_failpoint) \

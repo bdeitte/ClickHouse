@@ -11,6 +11,7 @@
 #include <Core/UUID.h>
 #include <Databases/DatabaseAtomic.h>
 #include <Databases/DatabaseOrdinary.h>
+#include <Databases/MetadataExchange.h>
 #include <Disks/DiskLocal.h>
 #include <Disks/IDisk.h>
 #include <IO/ReadBufferFromFile.h>
@@ -41,6 +42,7 @@
 #include <Common/Exception.h>
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/ErrnoException.h>
+#include <Common/FailPoint.h>
 #include <Common/assert_cast.h>
 #include <Common/computeMaxTableNameLength.h>
 #include <Common/escapeForFileName.h>
@@ -48,6 +50,8 @@
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/ThreadPool.h>
+
+#include <fmt/ranges.h>
 
 
 namespace fs = std::filesystem;
@@ -68,6 +72,11 @@ namespace Setting
     extern const SettingsSeconds lock_acquire_timeout;
     extern const SettingsUInt64 max_parser_backtracks;
     extern const SettingsUInt64 max_parser_depth;
+}
+
+namespace FailPoints
+{
+    extern const char database_atomic_load_metadata_disk_read_only[];
 }
 
 namespace ErrorCodes
@@ -521,7 +530,8 @@ void DatabaseOnDisk::renameTable(
         IDatabase & to_database,
         const String & to_table_name,
         bool exchange,
-        bool dictionary)
+        bool dictionary,
+        bool /* allow_exchange_emulation */)
 {
     if (exchange)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Tables can be exchanged only in Atomic databases");
@@ -768,6 +778,15 @@ time_t DatabaseOnDisk::getObjectMetadataModificationTime(const String & object_n
     }
 }
 
+bool DatabaseOnDisk::isMetadataDiskReadOnlyAtLoad(const DiskPtr & disk)
+{
+    /// Lets a test load a database as from a read-only disk: `clickhouse-local` skips the access check of disks, which is what
+    /// marks a local disk read-only, and a test running as root cannot make a directory read-only.
+    bool read_only = disk->isReadOnly();
+    fiu_do_on(FailPoints::database_atomic_load_metadata_disk_read_only, { read_only = true; });
+    return read_only;
+}
+
 void DatabaseOnDisk::iterateMetadataFiles(const IteratingFunction & process_metadata_file) const
 {
     auto db_disk = getDisk();
@@ -796,46 +815,86 @@ void DatabaseOnDisk::iterateMetadataFiles(const IteratingFunction & process_meta
     /// Metadata files to load: name and flag for .tmp_drop files
     std::vector<std::pair<String, bool>> metadata_files;
 
-    for (const auto it = db_disk->iterateDirectory(metadata_path); it->isValid(); it->next())
+    /// The files of swaps of metadata files with a record that a crash interrupted, see `undoInterruptedMetadataExchangesAtLoad`.
+    bool has_exchange_files = false;
+    Strings exchange_tmp_file_names;
+
+    auto list_metadata_files = [&]
     {
-        auto sub_path = fs::path(it->path());
-        String file_name = it->name();
-        /// For '.svn', '.gitignore' directory and similar.
-        if (!file_name.empty() && file_name.at(0) == '.')
-            continue;
+        metadata_files.clear();
+        has_exchange_files = false;
+        exchange_tmp_file_names.clear();
+        for (const auto it = db_disk->iterateDirectory(metadata_path); it->isValid(); it->next())
+        {
+            auto sub_path = fs::path(it->path());
+            String file_name = it->name();
+            if (isMetadataExchangeFileName(file_name))
+            {
+                has_exchange_files = true;
+                if (!file_name.starts_with('.'))
+                    exchange_tmp_file_names.push_back(file_name);
+                continue;
+            }
 
-        /// There are .sql.bak files - skip them.
-        if (endsWith(file_name, ".sql.bak"))
-            continue;
+            /// For '.svn', '.gitignore' directory and similar.
+            if (!file_name.empty() && file_name.at(0) == '.')
+                continue;
 
-        /// Permanently detached table flag
-        if (endsWith(file_name, ".sql.detached"))
-            continue;
+            /// There are .sql.bak files - skip them.
+            if (endsWith(file_name, ".sql.bak"))
+                continue;
 
-        if (endsWith(file_name, ".sql.tmp_drop"))
-        {
-            /// There are files that we tried to delete previously
-            metadata_files.emplace_back(file_name, false);
+            /// Permanently detached table flag
+            if (endsWith(file_name, ".sql.detached"))
+                continue;
+
+            if (endsWith(file_name, ".sql.tmp_drop"))
+            {
+                /// There are files that we tried to delete previously
+                metadata_files.emplace_back(file_name, false);
+            }
+            else if (endsWith(file_name, ".tmp_move_from") || endsWith(file_name, ".tmp_move_to"))
+            {
+                /// There are temp files generated in MetadataStorageFromPlainObjectStorageMoveFileOperation
+                LOG_INFO(log, "Removing file {}", sub_path.string());
+                db_disk->removeFileIfExists(sub_path);
+            }
+            else if (endsWith(file_name, ".sql.tmp"))
+            {
+                /// There are files .sql.tmp - delete
+                LOG_INFO(log, "Removing file {}", sub_path.string());
+                db_disk->removeFileIfExists(sub_path);
+            }
+            else if (endsWith(file_name, ".sql"))
+            {
+                /// The required files have names like `table_name.sql`
+                metadata_files.emplace_back(file_name, true);
+            }
+            else
+                throw Exception(ErrorCodes::INCORRECT_FILE_NAME, "Incorrect file extension: {} in metadata directory {}", file_name, getMetadataPath());
         }
-        else if (endsWith(file_name, ".tmp_move_from") || endsWith(file_name, ".tmp_move_to"))
-        {
-            /// There are temp files generated in MetadataStorageFromPlainObjectStorageMoveFileOperation
-            LOG_INFO(log, "Removing file {}", sub_path.string());
-            db_disk->removeFileIfExists(sub_path);
-        }
-        else if (endsWith(file_name, ".sql.tmp"))
-        {
-            /// There are files .sql.tmp - delete
-            LOG_INFO(log, "Removing file {}", sub_path.string());
-            db_disk->removeFileIfExists(sub_path);
-        }
-        else if (endsWith(file_name, ".sql"))
-        {
-            /// The required files have names like `table_name.sql`
-            metadata_files.emplace_back(file_name, true);
-        }
-        else
-            throw Exception(ErrorCodes::INCORRECT_FILE_NAME, "Incorrect file extension: {} in metadata directory {}", file_name, getMetadataPath());
+    };
+
+    list_metadata_files();
+    const bool undid_exchanges = has_exchange_files && undoInterruptedMetadataExchangesAtLoad();
+    /// The files are listed again because a crash after the first move leaves one `.sql` file missing until the undo puts it back.
+    if (undid_exchanges)
+        list_metadata_files();
+
+    if (!exchange_tmp_file_names.empty())
+    {
+        std::sort(exchange_tmp_file_names.begin(), exchange_tmp_file_names.end());
+        if (undid_exchanges)
+            throw Exception(ErrorCodes::INCORRECT_FILE_NAME,
+                "Temporary files of exchanges of metadata files that were not undone are left in metadata directory {}: {}. "
+                "For each of them, no valid exchange record is next to it: the record is missing, or a warning in the log reports "
+                "that it is not an exchange record. To repair manually, restore the intended content of the two files of each "
+                "exchange, remove its temporary file, and load the database again",
+                getMetadataPath(), fmt::join(exchange_tmp_file_names, ", "));
+        throw Exception(ErrorCodes::INCORRECT_FILE_NAME,
+            "Temporary files of interrupted exchanges of metadata files are left in metadata directory {}: {}. "
+            "A load undoes an exchange from its record only in an `Atomic` database on a local disk that is writable",
+            getMetadataPath(), fmt::join(exchange_tmp_file_names, ", "));
     }
 
     std::sort(metadata_files.begin(), metadata_files.end());
@@ -882,7 +941,7 @@ void DatabaseOnDisk::iterateMetadataFiles(const IteratingFunction & process_meta
                 continue;
 
             stale_files.insert(file_name);
-            if (db_disk->isReadOnly())
+            if (isMetadataDiskReadOnlyAtLoad(db_disk))
             {
                 LOG_WARNING(log, "Skipping {}: it is a copy of {}", path, *copy);
                 continue;
@@ -998,10 +1057,19 @@ ASTPtr DatabaseOnDisk::parseQueryFromMetadata(
     return ast;
 }
 
+ASTPtr DatabaseOnDisk::readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const
+{
+    return parseQueryFromMetadata(log, getContext(), getDisk(), getObjectMetadataPath(table_name), throw_on_error);
+}
+
+String DatabaseOnDisk::readObjectMetadataFile(const String & object_name) const
+{
+    return readMetadataFile(getDisk(), getObjectMetadataPath(object_name));
+}
+
 ASTPtr DatabaseOnDisk::getCreateQueryFromMetadata(const String & table_name, bool throw_on_error) const
 {
-    auto db_disk = getDisk();
-    ASTPtr ast = parseQueryFromMetadata(log, getContext(), db_disk, getObjectMetadataPath(table_name), throw_on_error);
+    ASTPtr ast = readCreateQueryFromMetadataFile(table_name, throw_on_error);
 
     if (ast)
     {

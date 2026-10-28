@@ -1,0 +1,11 @@
+<clickhouse>
+    <!-- A `local` disk whose directory the test mounts the NFS export of `nfs1` over, for a database with `SETTINGS disk = 'nfs'`. -->
+    <storage_configuration>
+        <disks>
+            <nfs>
+                <type>local</type>
+                <path>/var/lib/clickhouse/disks/nfs/</path>
+            </nfs>
+        </disks>
+    </storage_configuration>
+</clickhouse>

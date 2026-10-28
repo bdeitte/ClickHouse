@@ -68,7 +68,8 @@ public:
         IDatabase & to_database,
         const String & to_table_name,
         bool exchange,
-        bool dictionary) override;
+        bool dictionary,
+        bool allow_exchange_emulation) override;
 
     void drop(ContextPtr context) override;
 
@@ -122,6 +123,15 @@ protected:
 
     void iterateMetadataFiles(const IteratingFunction & process_metadata_file) const;
 
+    /// Called by `iterateMetadataFiles` when the metadata directory has files of swaps of metadata files with a record,
+    /// before any metadata file is processed. Returns whether it undid the swaps, so that the files are listed again.
+    virtual bool undoInterruptedMetadataExchangesAtLoad() const { return false; }
+
+    /// Whether the load of the database treats its metadata disk `disk` as read-only: the disk is read-only, or a test made the load
+    /// treat it so with the failpoint `database_atomic_load_metadata_disk_read_only`. Every branch of the load that depends on a
+    /// read-only metadata disk calls it, so that the failpoint gives the behavior of a read-only disk.
+    static bool isMetadataDiskReadOnlyAtLoad(const DiskPtr & disk);
+
     ASTPtr getCreateDatabaseQueryImpl() const override TSA_REQUIRES(mutex);
     ASTPtr getCreateTableQueryImpl(
         const String & table_name,
@@ -129,6 +139,12 @@ protected:
         bool throw_on_error) const override;
 
     virtual ASTPtr getCreateQueryFromMetadata(const String & table_name, bool throw_on_error) const;
+    /// Reads and parses the metadata file of `table_name` for `getCreateQueryFromMetadata`. Callers do not hold `mutex`, so an override
+    /// may take it, but not while it holds a lock that a swap takes after `mutex`, such as `DatabaseAtomic::metadata_files_mutex`.
+    virtual ASTPtr readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const;
+    /// Reads the metadata file of `object_name` for `alterTable`. An override must not take `mutex` while it holds a lock that a swap
+    /// takes after `mutex`, such as `DatabaseAtomic::metadata_files_mutex`.
+    virtual String readObjectMetadataFile(const String & object_name) const;
     ASTPtr getCreateQueryFromStorage(const String & table_name, const StoragePtr & storage, bool throw_on_error) const;
 
     virtual void commitCreateTable(const ASTCreateQuery & query, const StoragePtr & table,

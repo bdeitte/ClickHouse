@@ -652,16 +652,21 @@ void StorageMaterializedView::drop()
     dropInnerTableIfAny(/* sync */ false, getContext());
 }
 
-void StorageMaterializedView::dropInnerTableIfAny(bool sync, ContextPtr local_context)
+std::vector<StorageID> StorageMaterializedView::getInnerTableIdsToDrop() const
 {
     if (!has_inner_table)
-        return;
+        return {};
 
-    std::vector<StorageID> to_drop = {getTargetTableId()};
+    auto target_id = getTargetTableId();
+    std::vector<StorageID> inner_ids = {target_id};
     if (!fixed_uuid)
-        to_drop.push_back(StorageID(to_drop[0].getDatabaseName(), ".tmp" + to_drop[0].getTableName()));
+        inner_ids.emplace_back(target_id.getDatabaseName(), ".tmp" + target_id.getTableName());
+    return inner_ids;
+}
 
-    for (const StorageID & inner_table_id : to_drop)
+void StorageMaterializedView::dropInnerTableIfAny(bool sync, ContextPtr local_context)
+{
+    for (const StorageID & inner_table_id : getInnerTableIdsToDrop())
     {
         /// We will use `sync` argument when this function is called from a DROP query
         /// and will ignore database_atomic_wait_for_drop_and_detach_synchronously when it's called from drop task.
@@ -691,27 +696,29 @@ void StorageMaterializedView::truncate(const ASTPtr &, const StorageMetadataPtr 
 void StorageMaterializedView::checkTableSizeBelowDropLimit(ContextPtr query_context) const
 {
     /// `MATERIALIZED VIEW ... TO <existing_table>` keeps no on-disk data of its own;
-    /// the implicit drop will not touch the user-owned target.
-    if (!has_inner_table)
-        return;
-
-    /// Mirror `dropInnerTableIfAny`: it builds `to_drop` from `getTargetTableId()` and,
-    /// when `!fixed_uuid` (refreshable / non-append), additionally from the `.tmp` inner
-    /// table name. We must size-check every table that the implicit drop could delete,
-    /// otherwise the zeroed `max_table_size_to_drop` context would silently bypass the
-    /// guard for a non-empty `.tmp.inner...` produced by a previous refresh.
-    auto target_id = getTargetTableId();
-    std::vector<StorageID> to_check = {target_id};
-    if (!fixed_uuid)
-        to_check.push_back(StorageID(target_id.getDatabaseName(), ".tmp" + target_id.getTableName()));
-
-    for (const StorageID & inner_id : to_check)
+    /// the implicit drop will not touch the user-owned target, and `getInnerTableIdsToDrop` returns nothing.
+    /// We must size-check every table that the implicit drop could delete, including the `.tmp` inner
+    /// table of a refreshable view that is not `APPEND`, otherwise the zeroed `max_table_size_to_drop`
+    /// context would silently bypass the guard for a non-empty `.tmp.inner...` produced by a previous refresh.
+    for (const StorageID & inner_id : getInnerTableIdsToDrop())
     {
         /// On a race (e.g. `SYSTEM RESTART REPLICA` detached the inner table),
         /// `dropInnerTableIfAny` is a no-op too, so we mirror its tolerance.
         if (auto inner = DatabaseCatalog::instance().tryGetTable(inner_id, getContext()))
             inner->checkTableSizeBelowDropLimit(query_context);
     }
+}
+
+void StorageMaterializedView::checkTableCanBeDropped(ContextPtr /* query_context */) const
+{
+    /// A refresh whose exchange of the `.tmp` table and the target table could not be finished fences both names until the
+    /// server restarts, and then the `DROP` of an inner table in `dropInnerTableIfAny` is refused. That runs after `DROP`
+    /// has shut the view down and removed its dependencies, so the view is refused here instead, before the shutdown.
+    /// Without the DDL guards of the inner tables, this can miss a fence set at the same moment. The `DROP` of the inner
+    /// table still refuses that case.
+    for (const StorageID & inner_id : getInnerTableIdsToDrop())
+        if (auto database = DatabaseCatalog::instance().tryGetDatabase(inner_id.getDatabaseName()))
+            database->checkNoUnfinishedExchange(inner_id.getTableName());
 }
 
 void StorageMaterializedView::checkStatementCanBeForwarded() const
@@ -866,7 +873,9 @@ std::optional<StorageID> StorageMaterializedView::exchangeTargetTable(StorageID 
     rename_query->exchange = exchange;
     rename_query->addElement(fresh_table.database_name, fresh_table.table_name, stale_table_id.database_name, stale_table_id.table_name);
 
-    InterpreterRenameQuery(rename_query, refresh_context).execute();
+    InterpreterRenameQuery interpreter_rename(rename_query, refresh_context);
+    interpreter_rename.setAllowExchangeEmulation(true);
+    interpreter_rename.execute();
 
     return exchange ? std::make_optional(fresh_table) : std::nullopt;
 }

@@ -1,5 +1,6 @@
 #include <filesystem>
 #include <thread>
+#include <Core/ServerSettings.h>
 #include <Core/Settings.h>
 #include <Core/UUID.h>
 #include <Databases/DatabaseAtomic.h>
@@ -7,6 +8,8 @@
 #include <Databases/DatabaseMetadataDiskSettings.h>
 #include <Databases/DatabaseOnDisk.h>
 #include <Databases/DatabaseReplicated.h>
+#include <Databases/MetadataExchange.h>
+#include <Disks/DiskLocal.h>
 #include <Disks/IStoragePolicy.h>
 #include <Interpreters/DDLTask.h>
 #include <Interpreters/DatabaseCatalog.h>
@@ -22,6 +25,8 @@
 #include <Common/AsyncLoader.h>
 #include <Common/CurrentThread.h>
 #include <Common/FailPoint.h>
+#include <Common/LockMemoryExceptionInThread.h>
+#include <Common/Stopwatch.h>
 #include <Interpreters/ProcessList.h>
 
 
@@ -33,15 +38,35 @@ namespace Setting
 {
     extern const SettingsBool check_referential_table_dependencies;
     extern const SettingsBool check_table_dependencies;
+    extern const SettingsBool fsync_metadata;
+}
+
+namespace ServerSetting
+{
+    extern const ServerSettingsBool database_atomic_allow_exchange_emulation;
 }
 
 namespace FailPoints
 {
     extern const char rename_database_after_dependency_check[];
+    extern const char database_atomic_exchange_not_supported[];
+    extern const char database_atomic_exchange_fail_before_first_move[];
+    extern const char database_atomic_exchange_fail_after_first_move[];
+    extern const char database_atomic_exchange_fail_after_second_move[];
+    extern const char database_atomic_exchange_fail_after_third_move[];
+    extern const char database_atomic_exchange_always_fail_before_first_move[];
+    extern const char database_atomic_exchange_fail_to_finish[];
+    extern const char database_atomic_exchange_fail_after_finish[];
+    extern const char database_atomic_exchange_fail_after_writing_record[];
+    extern const char database_atomic_exchange_fail_to_remove_record[];
+    extern const char database_atomic_exchange_fail_to_sync_removed_record[];
+    extern const char database_atomic_exchange_pause_after_second_move[];
+    extern const char database_atomic_pause_before_reading_create_query[];
 }
 
 namespace ErrorCodes
 {
+    extern const int FAULT_INJECTED;
     extern const int UNKNOWN_TABLE;
     extern const int UNKNOWN_DATABASE;
     extern const int TABLE_ALREADY_EXISTS;
@@ -53,12 +78,33 @@ namespace ErrorCodes
     extern const int ABORTED;
     extern const int LOGICAL_ERROR;
     extern const int UNFINISHED;
+    extern const int UNFINISHED_METADATA_EXCHANGE;
+    extern const int UNSUPPORTED_METHOD;
 }
 
 
 namespace DatabaseMetadataDiskSetting
 {
 extern const DatabaseMetadataDiskSettingsString disk;
+}
+
+namespace
+{
+
+/// Only a query whose id starts with the prefix pauses at `database_atomic_pause_before_reading_create_query`,
+/// so that the readers of other queries and of background threads do not take the pause meant for a test.
+constexpr std::string_view pause_before_reading_create_query_query_id_prefix = "atomic_pause_before_reading_create_query_";
+
+/// Only a query whose id starts with the prefix pauses at `database_atomic_exchange_pause_after_second_move`,
+/// so that the swaps of other queries and of refreshes do not take the pause meant for a test.
+constexpr std::string_view pause_after_second_move_query_id_prefix = "atomic_exchange_pause_after_second_move_";
+
+/// Ends the errors of the queries that a fence refuses. Only the error of the query that ran the exchange and the server log
+/// have the full text of what the restart does, so that every refused query does not repeat it.
+constexpr auto unfinished_exchange_details
+    = "The error of the query that ran the exchange, and the error about it in the server log, say what the restart does "
+      "with the two files and where the rows inserted until then end up";
+
 }
 
 class AtomicDatabaseTablesSnapshotIterator final : public DatabaseTablesSnapshotIterator
@@ -182,6 +228,7 @@ StoragePtr DatabaseAtomic::detachTable(ContextPtr /* context */, const String & 
     StoragePtr detached_table;
     {
         std::lock_guard lock(mutex);
+        assertTableHasNoUnfinishedExchangeUnlocked(name);
         detached_table = DatabaseOrdinary::detachTableUnlocked(name);
         table_name_to_path.erase(name);
         detached_tables.emplace(detached_table->getStorageID().uuid, detached_table);
@@ -220,6 +267,7 @@ void DatabaseAtomic::dropTableImpl(ContextPtr local_context, const String & tabl
     auto db_disk = getDisk();
     {
         std::lock_guard lock(mutex);
+        assertTableHasNoUnfinishedExchangeUnlocked(table_name);
         table = getTableUnlocked(table_name);
         table_metadata_path_drop = DatabaseCatalog::instance().getPathForDroppedMetadata(table->getStorageID());
 
@@ -250,7 +298,7 @@ void DatabaseAtomic::dropTableImpl(ContextPtr local_context, const String & tabl
 }
 
 void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_name, IDatabase & to_database,
-                                 const String & to_table_name, bool exchange, bool dictionary)
+                                 const String & to_table_name, bool exchange, bool dictionary, bool allow_exchange_emulation)
     TSA_NO_THREAD_SAFETY_ANALYSIS   /// TSA does not support conditional locking
 {
     auto component_guard = Coordination::setCurrentComponent("DatabaseAtomic::renameTable");
@@ -259,7 +307,8 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
         if (typeid_cast<DatabaseOrdinary *>(&to_database))
         {
             /// Allow moving tables between Atomic and Ordinary (with table lock)
-            DatabaseOnDisk::renameTable(local_context, table_name, to_database, to_table_name, exchange, dictionary);
+            DatabaseOnDisk::renameTable(
+                local_context, table_name, to_database, to_table_name, exchange, dictionary, allow_exchange_emulation);
             return;
         }
 
@@ -276,6 +325,12 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
 
     auto & other_db = dynamic_cast<DatabaseAtomic &>(to_database);
     bool inside_database = this == &other_db;
+
+    /// Where the filesystem cannot exchange two files atomically, such as NFS, an exchange of two metadata files can be emulated
+    /// with three moves and a record, see `exchangeMetadataFilesWithRecord`. Only inside one database that is exactly `Atomic`,
+    /// so not `Replicated`, on a local disk, and only with the server setting on. Everything else exchanges as without the emulation.
+    const bool emulation_applies = exchange && inside_database && typeid(*this) == typeid(DatabaseAtomic) && canEmulateExchange(getDisk());
+    const bool emulation_enabled = local_context->getServerSettings()[ServerSetting::database_atomic_allow_exchange_emulation];
 
     ensurePopulated();
     if (!inside_database)
@@ -351,6 +406,9 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
         db_lock = std::unique_lock{mutex};
     }
 
+    assertTableHasNoUnfinishedExchangeUnlocked(table_name);
+    other_db.assertTableHasNoUnfinishedExchangeUnlocked(to_table_name);
+
     if (!exchange)
         other_db.checkMetadataFilenameAvailabilityUnlocked(to_table_name);
 
@@ -391,9 +449,89 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
     /// NOTE: replica will be lost if server crashes before the following rename
     /// TODO better detection and recovery
     if (exchange)
-        db_disk->renameExchange(old_metadata_path, new_metadata_path);
+    {
+        /// Makes the filesystem report that it cannot exchange two files atomically, as NFS does. It applies in every branch below,
+        /// so with the server setting `database_atomic_allow_exchange_emulation` on or off.
+        bool exchange_not_supported = false;
+        fiu_do_on(FailPoints::database_atomic_exchange_not_supported, { exchange_not_supported = true; });
+
+        if (emulation_applies && emulation_enabled)
+        {
+            /// It returns `false` when the filesystem does not support the exchange, and throws on every other error.
+            if (exchange_not_supported || !db_disk->renameExchangeIfSupported(old_metadata_path, new_metadata_path))
+            {
+                if (!allow_exchange_emulation)
+                    throw Exception(
+                        ErrorCodes::UNSUPPORTED_METHOD,
+                        "Cannot exchange {} and {}: the filesystem, such as NFS, cannot exchange two files atomically. "
+                        "`EXCHANGE TABLES` and `EXCHANGE DICTIONARIES` are not emulated on such a filesystem. `CREATE OR REPLACE`, "
+                        "`REPLACE TABLE` and refreshes of refreshable materialized views work on it with the server setting "
+                        "`database_atomic_allow_exchange_emulation`",
+                        old_metadata_path,
+                        new_metadata_path);
+
+                /// The time the exchange adds while it holds `mutex`, which every lookup of a table of the database waits for.
+                /// On NFS each step below is a round trip to the server.
+                Stopwatch watch;
+
+                /// What each of the two files holds after the exchange.
+                MetadataExchangeRecord record;
+                record.old_path = old_metadata_path;
+                record.new_path = new_metadata_path;
+                record.old_path_content = readMetadataFile(db_disk, new_metadata_path);
+                record.new_path_content = readMetadataFile(db_disk, old_metadata_path);
+                const bool fsync = local_context->getSettingsRef()[Setting::fsync_metadata];
+                /// Once per database, so that frequent refreshes do not repeat it.
+                if (!fsync && !warned_about_exchange_without_fsync.exchange(true, std::memory_order_relaxed))
+                    LOG_WARNING(log, "The exchange of {} and {} runs without `fsync_metadata`. If the server crashes after such an "
+                        "exchange succeeds, the removal of its record may be lost, and the next load then undoes the exchange, which "
+                        "puts the two tables back under their names from before it. This warning is logged once for database {}",
+                        old_metadata_path, new_metadata_path, backQuote(database_name));
+                try
+                {
+                    exchangeMetadataFilesWithRecord(table_name, to_table_name, db_disk, record, fsync);
+                }
+                catch (...)
+                {
+                    /// Neither name had a fence when the exchange began, see the checks above, so a fence now is from this exchange.
+                    if (unfinished_exchanges.contains(table_name))
+                        warnAboutUnfinishedExchange(db_lock, table_name, to_table_name);
+                    throw;
+                }
+                LOG_DEBUG(log, "Exchanged {} and {} with an exchange record in {:.3f} ms while holding the mutex of database {}",
+                    old_metadata_path, new_metadata_path, static_cast<double>(watch.elapsedMicroseconds()) / 1000.0, backQuote(database_name));
+            }
+        }
+        else if (emulation_applies && allow_exchange_emulation)
+        {
+            /// The server setting would let this exchange work on such a filesystem, so the error says so.
+            if (exchange_not_supported || !db_disk->renameExchangeIfSupported(old_metadata_path, new_metadata_path))
+                throw Exception(
+                    ErrorCodes::UNSUPPORTED_METHOD,
+                    "Cannot exchange {} and {}: the filesystem, such as NFS, cannot exchange two files atomically. `CREATE OR REPLACE`, "
+                    "`REPLACE TABLE` and refreshes of refreshable materialized views work on it when the server setting "
+                    "`database_atomic_allow_exchange_emulation` is enabled",
+                    old_metadata_path,
+                    new_metadata_path);
+        }
+        else if (exchange_not_supported)
+        {
+            /// As `renameExchange` fails on such a filesystem.
+            throw Exception(
+                ErrorCodes::UNSUPPORTED_METHOD,
+                "Cannot exchange {} and {}: the filesystem does not support an atomic exchange of files",
+                old_metadata_path,
+                new_metadata_path);
+        }
+        else
+        {
+            db_disk->renameExchange(old_metadata_path, new_metadata_path);
+        }
+    }
     else
+    {
         db_disk->moveFile(old_metadata_path, new_metadata_path);
+    }
 
     /// After metadata was successfully moved, the following methods should not throw (if they do, it's a logical error)
     table_data_path = detach(*this, table_name, table->storesDataOnDisk());
@@ -431,6 +569,7 @@ void DatabaseAtomic::commitCreateTable(const ASTCreateQuery & query, const Stora
         if (query.getDatabase() != database_name)
             throw Exception(ErrorCodes::UNKNOWN_DATABASE, "Database was renamed to `{}`, cannot create table in `{}`",
                             database_name, query.getDatabase());
+        assertTableHasNoUnfinishedExchangeUnlocked(query.getTable());
         /// Do some checks before renaming file from .tmp to .sql
         not_in_use = cleanupDetachedTables();
         assertDetachedTableNotInUse(query.uuid);
@@ -469,6 +608,7 @@ void DatabaseAtomic::commitAlterTable(const StorageID & table_id, const String &
     });
 
     std::lock_guard lock{mutex};
+    assertTableHasNoUnfinishedExchangeUnlocked(table_id.table_name);
     auto actual_table_id = getTableUnlocked(table_id.table_name)->getStorageID();
 
     if (table_id.uuid != actual_table_id.uuid)
@@ -585,6 +725,476 @@ void DatabaseAtomic::beforeLoadingMetadata(ContextMutablePtr /*context*/, Loadin
         }
 
         db_disk->removeFileIfExists(table_path);
+    }
+}
+
+ASTPtr DatabaseAtomic::readCreateQueryFromMetadataFile(const String & table_name, bool throw_on_error) const
+{
+    /// Lets a test hold a reader that has found the table until a swap is between its moves. This runs for every table in
+    /// `system.tables`, so the check of the query id comes second: it is not evaluated in builds without failpoints.
+    if (FailPointInjection::hasAnyFailPointBeenRegistered()
+        && CurrentThread::getQueryId().starts_with(pause_before_reading_create_query_query_id_prefix))
+        FailPointInjection::pauseFailPoint(FailPoints::database_atomic_pause_before_reading_create_query);
+    /// The file of a table of an unfinished exchange can be missing or hold the definition of the other table. Checked before
+    /// the read, so that a missing file is reported as the unfinished exchange, and after it, because an exchange that fails
+    /// during the read sets the fence before it releases `metadata_files_mutex`. Never while holding `metadata_files_mutex`,
+    /// because the check takes `mutex`, which an exchange holds while it waits for `metadata_files_mutex`.
+    /// Without a fence in the database, neither check locks `mutex`, see `has_unfinished_exchange`.
+    auto table_has_unfinished_exchange = [&]
+    {
+        if (!has_unfinished_exchange.load(std::memory_order_relaxed))
+            return false;
+        std::lock_guard lock{mutex};
+        if (!unfinished_exchanges.contains(table_name))
+            return false;
+        if (throw_on_error)
+            assertTableHasNoUnfinishedExchangeUnlocked(table_name);
+        return true;
+    };
+    if (table_has_unfinished_exchange())
+        return nullptr;
+    ASTPtr ast;
+    {
+        std::shared_lock files_lock(metadata_files_mutex);
+        ast = DatabaseOrdinary::readCreateQueryFromMetadataFile(table_name, throw_on_error);
+    }
+    if (table_has_unfinished_exchange())
+        return nullptr;
+    return ast;
+}
+
+std::vector<std::pair<ASTPtr, StoragePtr>> DatabaseAtomic::getTablesForBackup(const FilterByNameFunction & filter, const ContextPtr & local_context) const
+{
+    /// The base skips a table whose definition cannot be read, which is the case for the tables of an unfinished exchange,
+    /// so they are refused here instead of left out of the backup. Checked after the reads, see `readCreateQueryFromMetadataFile`.
+    auto res = DatabaseOrdinary::getTablesForBackup(filter, local_context);
+    /// See `has_unfinished_exchange`.
+    if (!has_unfinished_exchange.load(std::memory_order_relaxed))
+        return res;
+    std::lock_guard lock{mutex};
+    for (const auto & [table_name, _] : unfinished_exchanges)
+        if (!filter || filter(table_name))
+            assertTableHasNoUnfinishedExchangeUnlocked(table_name);
+    return res;
+}
+
+void DatabaseAtomic::checkNoUnfinishedExchange(const String & table_name) const
+{
+    /// The caller holds the DDL guard of `table_name`, see `has_unfinished_exchange`, or accepts missing a fence set at the
+    /// same moment, see `StorageMaterializedView::checkTableCanBeDropped` and `TRUNCATE ALL TABLES` in `InterpreterDropQuery`.
+    /// `DatabaseOverlay::getCreateTableQueryImpl` calls it after a read of the definition that the fence refused in the same thread.
+    /// With an empty name, the caller holds no lock that an exchange takes, so the check locks `mutex` and waits for an exchange
+    /// that holds it.
+    if (!table_name.empty() && !has_unfinished_exchange.load(std::memory_order_relaxed))
+        return;
+    std::lock_guard lock{mutex};
+    if (!table_name.empty())
+    {
+        assertTableHasNoUnfinishedExchangeUnlocked(table_name);
+        return;
+    }
+    if (!unfinished_exchanges.empty())
+    {
+        const auto & [_, files] = *unfinished_exchanges.begin();
+        throw Exception(ErrorCodes::UNFINISHED_METADATA_EXCHANGE,
+                        "An exchange of {} in database {} failed and could not be finished, so the database cannot be dropped, "
+                        "detached or truncated until the server restarts. {}",
+                        files, backQuote(database_name), unfinished_exchange_details);
+    }
+}
+
+void DatabaseAtomic::warnAboutUnfinishedExchange(
+    std::unique_lock<std::mutex> & lock, const String & table_name, const String & other_table_name) const noexcept
+    TSA_NO_THREAD_SAFETY_ANALYSIS   /// Reads `database_name` under `lock`, then releases it.
+{
+    try
+    {
+        const auto warning = PreformattedMessage::create(
+            "An exchange of the metadata files of {}.{} and {}.{} failed and could not be finished, so DDL on these two tables "
+            "and reads of their definitions fail until the server restarts. The server log has an error for each such exchange "
+            "that says what the restart does. If several exchanges failed, this warning is about the last one",
+            backQuote(database_name), backQuote(table_name), backQuote(database_name), backQuote(other_table_name));
+        /// `system.warnings` is updated under the lock of the global context, so `mutex` is released first.
+        lock.unlock();
+        getContext()->addOrUpdateWarningMessage(Context::WarningType::UNFINISHED_METADATA_EXCHANGE, warning);
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log, "Cannot add the warning about an exchange of metadata files that could not be finished");
+    }
+}
+
+void DatabaseAtomic::assertTableHasNoUnfinishedExchangeUnlocked(const String & table_name) const
+{
+    if (auto it = unfinished_exchanges.find(table_name); it != unfinished_exchanges.end())
+        throw Exception(ErrorCodes::UNFINISHED_METADATA_EXCHANGE,
+                        "An exchange of {} failed and could not be finished, so DDL on table {}.{} and reads of its definition "
+                        "fail until the server restarts. {}",
+                        it->second, backQuote(database_name), backQuote(table_name), unfinished_exchange_details);
+}
+
+String DatabaseAtomic::readObjectMetadataFile(const String & object_name) const
+{
+    std::shared_lock files_lock(metadata_files_mutex);
+    return DatabaseOrdinary::readObjectMetadataFile(object_name);
+}
+
+time_t DatabaseAtomic::getObjectMetadataModificationTime(const String & object_name) const
+{
+    std::shared_lock files_lock(metadata_files_mutex);
+    return DatabaseOrdinary::getObjectMetadataModificationTime(object_name);
+}
+
+bool DatabaseAtomic::undoInterruptedMetadataExchangesAtLoad() const
+{
+    /// This does not read the server setting `database_atomic_allow_exchange_emulation`: a crash can leave files of a swap
+    /// after the setting was turned off, and the load must still undo it.
+    /// `DatabaseReplicated` derives from `DatabaseAtomic` and is excluded, so it keeps refusing a temporary file of a swap.
+    if (typeid(*this) != typeid(DatabaseAtomic))
+        return false;
+    auto db_disk = getDisk();
+    if (!canEmulateExchange(db_disk))
+        return false;
+    /// The load cannot undo a swap on a read-only disk, so it refuses the files of a swap that the server did not apply.
+    if (isMetadataDiskReadOnlyAtLoad(db_disk))
+    {
+        checkNoMetadataExchangeToUndo(db_disk, getMetadataPath(), log);
+        return false;
+    }
+    const bool fsync = getContext()->getGlobalContext()->getSettingsRef()[Setting::fsync_metadata];
+    undoInterruptedMetadataExchanges(db_disk, getMetadataPath(), fsync, log);
+    return true;
+}
+
+bool DatabaseAtomic::canEmulateExchange(const DiskPtr & disk)
+{
+    return dynamic_cast<const DiskLocal *>(disk.get()) != nullptr;
+}
+
+void DatabaseAtomic::exchangeMetadataFilesWithRecord(
+    const String & table_name,
+    const String & other_table_name,
+    const DiskPtr & disk,
+    const MetadataExchangeRecord & record,
+    bool fsync)
+{
+    /// The exchange must be able to fence the two tables at every step, even when the query is over its memory limit. Otherwise
+    /// an allocation for the hint or for `unfinished_exchanges` could throw before both names are fenced, and DDL could change the
+    /// files of the exchange. It allocates only for the contents of two metadata files and for messages.
+    LockMemoryExceptionInThread lock_memory_tracker(VariableContext::Global);
+
+    const String record_path = metadataExchangeRecordPath(record.old_path);
+    const String files = fmt::format("{} and {}", record.old_path, record.new_path);
+    /// Built here, so that the `catch` of the `noexcept` lambdas below does not allocate.
+    const String finish_error_prefix = fmt::format("Cannot finish the exchange of {}", files);
+    const String remove_record_error_prefix = fmt::format("Cannot remove {}", record_path);
+    const String check_record_error_prefix = fmt::format("Cannot check whether {} exists", record_path);
+    const String sync_record_error_prefix = fmt::format("Cannot make the removal of {} durable", record_path);
+    /// What the restart does while the record is left. The fence refuses the cleanup `DROP` of the temporary table of
+    /// `CREATE OR REPLACE`, so this says what that table holds after the restart. `CORRUPTED_DATA` from the load of a database
+    /// at server start fails the start of the server.
+    const String undo_outcome =
+        "the next load undoes the exchange from it, or, if the files hold none of the recorded contents, reports "
+        "`CORRUPTED_DATA`, and the server does not start until the files are repaired by hand as that error describes. "
+        "The undo keeps each of the two tables under its name from before the exchange, with the rows inserted until the restart. "
+        "If the exchange was done by `CREATE OR REPLACE` or `REPLACE TABLE`, the replacement table, with the rows of its "
+        "`AS SELECT`, is left under its `_tmp_replace_*` name, so run the statement again and then drop that table";
+
+    enum class RecordState : uint8_t
+    {
+        Removed,
+        Left,
+        /// The filesystem cannot tell whether the record is left, or the removal could not be made durable, so it is not
+        /// known whether the record is there at the restart.
+        Unknown,
+    };
+
+    /// Removes the record and checks that it is gone. A removal can report an error after it succeeded, so after an error
+    /// the record is looked up. Sets `record_error` when the removal or its sync fails.
+    std::exception_ptr record_error;
+    auto remove_record = [&]() noexcept -> RecordState
+    {
+        bool removed = false;
+        try
+        {
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_to_remove_record,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault while removing an exchange record"); });
+            LOG_DEBUG(log, "Removing file {}", record_path);
+            disk->removeFileIfExists(record_path);
+            removed = true;
+        }
+        catch (...)
+        {
+            record_error = std::current_exception();
+            tryLogCurrentException(log, remove_record_error_prefix);
+        }
+        if (!removed)
+        {
+            try
+            {
+                if (disk->existsFile(record_path))
+                    return RecordState::Left;
+            }
+            catch (...)
+            {
+                tryLogCurrentException(log, check_record_error_prefix);
+                return RecordState::Unknown;
+            }
+        }
+        /// The record decides what the next load does, so its removal is made durable before the caller renames the tables
+        /// in memory. The sync also makes the moves durable, because they are in the same directory.
+        if (!fsync)
+            return RecordState::Removed;
+        try
+        {
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_to_sync_removed_record,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault while syncing the removal of an exchange record"); });
+            syncMetadataExchangeDirectory(disk, record_path);
+            return RecordState::Removed;
+        }
+        catch (...)
+        {
+            record_error = std::current_exception();
+            tryLogCurrentException(log, sync_record_error_prefix);
+        }
+        return RecordState::Unknown;
+    };
+
+    /// What the restart does after an exchange that left the two files as they were before it, but whose record `remove_record`
+    /// did not remove: `Left` or `Unknown`. The outcome is the same either way, because the load keeps two files that hold their
+    /// contents from before the exchange whether or not it finds the record.
+    /// Why `remove_record` returned `Unknown`: the removal failed and the record could not be looked up, or the removal could
+    /// not be made durable.
+    const String record_unknown = fmt::format(
+        "it is not known whether their record {} is there at the restart, because its removal could not be checked or made durable",
+        record_path);
+    auto record_left_or_unknown = [&](RecordState record_state) -> String
+    {
+        if (record_state == RecordState::Left)
+            return fmt::format("their record {} could not be removed, so {}", record_path, undo_outcome);
+        return fmt::format(
+            "{}. If the record is there, {}. If it is not, the next load keeps the two files, which hold their contents from "
+            "before the exchange",
+            record_unknown, undo_outcome);
+    };
+
+    /// A move can also report an error after it succeeded, so the state of the files decides, not the error.
+    std::exception_ptr error;
+
+    /// Without `metadata_files_mutex`: until the first move, readers do not need to wait.
+    try
+    {
+        writeMetadataExchangeRecord(disk, record, fsync);
+        fiu_do_on(FailPoints::database_atomic_exchange_fail_after_writing_record,
+            { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after writing an exchange record"); });
+    }
+    catch (...)
+    {
+        error = std::current_exception();
+    }
+    if (error)
+    {
+        /// No file was moved, so the two files are as before the exchange. But a record that the failed write left would make
+        /// the next load refuse the database once DDL changes either file, so it is removed, or the two tables are fenced.
+        const RecordState record_state = remove_record();
+        if (record_state == RecordState::Removed)
+            std::rethrow_exception(error);
+        fenceUnfinishedExchange(table_name, other_table_name, files,
+            fmt::format(
+                "The write of the record of the two files failed, so no file was moved, but {}", record_left_or_unknown(record_state)),
+            error);
+    }
+
+    /// Readers of the metadata files wait until the moves and the handling of their failure are over.
+    std::unique_lock files_lock(metadata_files_mutex);
+
+    LOG_DEBUG(log, "Exchanging {} and {} with an exchange record", record.old_path, record.new_path);
+
+    /// The temporary file exists only between the first and the last move, so it shows that an exchange is in progress.
+    const String tmp_path = metadataExchangeTmpPath(record.old_path);
+    /// On a filesystem without `RENAME_EXCHANGE`, such as NFS, `RENAME_NOREPLACE` fails with `EINVAL` too, so each `moveFile` checks
+    /// that its target is absent, then does a plain rename (`renameNoReplaceFallback`). That is safe here: no other query can create
+    /// a target while `mutex` and the DDL guards of both names are held, and every target is absent when its move runs. The two
+    /// metadata files are moved away by the move before. The temporary file of `table_name` is left only by a crash, or by an earlier
+    /// exchange of `table_name` that failed and was fenced, which refuses this exchange until the restart. The load at the restart
+    /// undoes that exchange or refuses to load the database.
+    auto try_move_files = [&]() -> std::exception_ptr
+    {
+        try
+        {
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_before_first_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault before the first move of an exchange"); });
+            fiu_do_on(FailPoints::database_atomic_exchange_always_fail_before_first_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault before the first move of an exchange"); });
+            disk->moveFile(record.old_path, tmp_path);
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_after_first_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the first move of an exchange"); });
+            disk->moveFile(record.new_path, record.old_path);
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_after_second_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the second move of an exchange"); });
+            /// Lets a test hold the swap while a file is missing, to check that readers wait for the moves. The query id is
+            /// checked second, so that it is not read in builds without failpoints.
+            if (FailPointInjection::hasAnyFailPointBeenRegistered()
+                && CurrentThread::getQueryId().starts_with(pause_after_second_move_query_id_prefix))
+                FailPointInjection::pauseFailPoint(FailPoints::database_atomic_exchange_pause_after_second_move);
+            disk->moveFile(tmp_path, record.new_path);
+            fiu_do_on(FailPoints::database_atomic_exchange_fail_after_third_move,
+                { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after the third move of an exchange"); });
+            return nullptr;
+        }
+        catch (...)
+        {
+            /// Handled below by the state of the files.
+            return std::current_exception();
+        }
+    };
+
+    enum class Outcome : uint8_t
+    {
+        Done,
+        Retry,
+        FailCleanly,
+        Fence,
+    };
+
+    auto handle_error = [&](bool retried) noexcept -> Outcome
+    {
+        try
+        {
+            switch (inspectMetadataExchange(disk, record))
+            {
+                case MetadataExchangeState::Interrupted:
+                    fiu_do_on(FailPoints::database_atomic_exchange_fail_to_finish,
+                        { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault before finishing an exchange"); });
+                    finishMetadataExchange(disk, record, fsync, log);
+                    /// As when the removal of the temporary file at the end of the finish reports an error after it succeeded.
+                    fiu_do_on(FailPoints::database_atomic_exchange_fail_after_finish,
+                        { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after finishing an exchange"); });
+                    LOG_WARNING(log, "Finished the exchange of {} and {} after an error: {}",
+                        record.old_path, record.new_path, getExceptionMessage(error, false));
+                    return Outcome::Done;
+                case MetadataExchangeState::AfterExchange:
+                    LOG_WARNING(log, "The exchange of {} and {} completed despite an error: {}",
+                        record.old_path, record.new_path, getExceptionMessage(error, false));
+                    return Outcome::Done;
+                case MetadataExchangeState::BeforeExchange:
+                    if (!retried)
+                        return Outcome::Retry;
+                    /// Nothing has changed, so the query can fail.
+                    return Outcome::FailCleanly;
+                case MetadataExchangeState::Inconsistent:
+                    return Outcome::Fence;
+            }
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, finish_error_prefix);
+        }
+        return Outcome::Fence;
+    };
+
+    error = try_move_files();
+    Outcome outcome = error ? handle_error(/* retried */ false) : Outcome::Done;
+    if (outcome == Outcome::Retry)
+    {
+        /// Runs the moves again instead of `finishMetadataExchange`. In `BeforeExchange` there is no temporary file, so a crash between
+        /// its two writes would leave two metadata files with the same UUID, and the next load would not see an interrupted exchange.
+        LOG_WARNING(log, "Retrying the exchange of {} and {} after an error: {}",
+            record.old_path, record.new_path, getExceptionMessage(error, false));
+        if (auto retry_error = try_move_files())
+        {
+            error = retry_error;
+            outcome = handle_error(/* retried */ true);
+        }
+        else
+        {
+            outcome = Outcome::Done;
+        }
+    }
+
+    /// The record stays for the next load, and until then DDL on the two tables fails.
+    if (outcome == Outcome::Fence)
+        fenceUnfinishedExchange(table_name, other_table_name, files,
+            fmt::format("The record {} is left, so {}", record_path, undo_outcome), error);
+
+    /// The caller renames the tables in memory only after the record is gone, see `undoInterruptedMetadataExchanges`. A record
+    /// that cannot be removed fences the two tables, and the next load undoes the exchange. That holds after a clean failure too,
+    /// whose files are as before the exchange: a record left without a fence would make the next load refuse the database once
+    /// DDL changes either file.
+    const RecordState record_state = remove_record();
+    if (record_state != RecordState::Removed)
+    {
+        if (outcome == Outcome::FailCleanly)
+            fenceUnfinishedExchange(table_name, other_table_name, files,
+                fmt::format("The two files were not exchanged, but {}", record_left_or_unknown(record_state)), error);
+        if (record_state == RecordState::Left)
+            fenceUnfinishedExchange(table_name, other_table_name, files,
+                fmt::format(
+                    "The two files were exchanged, but their record {} could not be removed, so {}", record_path, undo_outcome),
+                record_error);
+        /// The only case where the restart can keep the files exchanged while the server served the tables under their old names.
+        fenceUnfinishedExchange(table_name, other_table_name, files,
+            fmt::format(
+                "The two files were exchanged, but {}. If the record is there, {}. If it is not, the next load keeps the two files "
+                "exchanged, and the rows inserted into the replaced table until the restart are in the `_tmp_replace_*` table, "
+                "or in the `.tmp` table of a refresh, which the first refresh after the restart replaces",
+                record_unknown, undo_outcome),
+            record_error);
+    }
+
+    if (outcome == Outcome::FailCleanly)
+        std::rethrow_exception(error);
+}
+
+void DatabaseAtomic::fenceUnfinishedExchange(
+    const String & table_name,
+    const String & other_table_name,
+    const String & files,
+    String hint,
+    std::exception_ptr error)
+{
+    /// Until the restart, each name keeps the table it had before the exchange, because the exchange did not reach the tables
+    /// in memory.
+    hint += ". Until the restart, each of the two names keeps its table from before the exchange, and inserts reach those tables";
+    /// Until the restart, the fence refuses the `CREATE OR REPLACE` of the `.tmp` table by the next refresh.
+    hint += ". If the exchange was done by a refresh of a materialized view, the first refresh after the restart replaces the "
+        "leftover `.tmp` table";
+    /// The documentation also lists what else the fence refuses, such as the `ALTER` entries of a `ReplicatedMergeTree` table,
+    /// and, for a record in the state `RecordState::Unknown`, how to check the `.tmp` table before the first refresh replaces it.
+    hint += ". The section `Metadata on NFS` of the documentation of the `Atomic` engine describes the fence and the recovery";
+
+    unfinished_exchanges[table_name] = files;
+    unfinished_exchanges[other_table_name] = files;
+    has_unfinished_exchange.store(true, std::memory_order_relaxed);
+
+    LOG_ERROR(log, "Cannot finish the exchange of {} after an error: {}. DDL on the two tables and reads of their definitions "
+        "fail until the server restarts. {}", files, getExceptionMessage(error, false), hint);
+    const String message = fmt::format(
+        "The exchange of {} could not be finished, so DDL on the two tables and reads of their definitions fail "
+        "until the server restarts. {}", files, hint);
+
+    try
+    {
+        std::rethrow_exception(error);
+    }
+    catch (Exception & e)
+    {
+        e.addMessage(message);
+        throw;
+    }
+    catch (...)
+    {
+        /// A failed move on a local disk usually arrives as `std::filesystem::filesystem_error`, which cannot carry the message.
+        /// The new exception keeps its code and message. The version is left out, because the final report adds it.
+        throw [&]
+        {
+            auto e = Exception::createRuntime(
+                getCurrentExceptionCode(),
+                getCurrentExceptionMessage(
+                    /* with_stacktrace */ false, /* check_embedded_stacktrace */ false, /* with_extra_info */ true, /* with_version */ false));
+            e.addMessage(message);
+            return e;
+        }();
     }
 }
 
@@ -1046,6 +1656,79 @@ explicitly in that case:
 ATTACH DATABASE db UUID '28f1c61c-2970-457a-bffe-454156ddcfef'
 SETTINGS disk = disk(type = 'local', path = '/var/lib/clickhouse-disks/db_disk');
 ```
+
+### Metadata on NFS {#metadata-on-nfs}
+
+`EXCHANGE TABLES`, `EXCHANGE DICTIONARIES`, `CREATE OR REPLACE`, `REPLACE TABLE` and the refreshes of refreshable materialized views
+that are not `APPEND` swap the metadata files of two tables with the system call `renameat2(RENAME_EXCHANGE)`. NFS, including
+Amazon EFS, does not support that call, so these statements fail with `UNSUPPORTED_METHOD` when the metadata of the database is on NFS.
+
+With the experimental server setting [`database_atomic_allow_exchange_emulation`](/reference/settings/server-settings/settings/other#database_atomic_allow_exchange_emulation),
+`CREATE OR REPLACE`, `REPLACE TABLE` and refreshes work on NFS when the metadata is on a `local` disk. The swap first writes a record
+`.<table>.sql.exchange` with both paths and the content each path has after the swap. It then renames `<table>.sql` to
+`<table>.sql.tmp_exchange`, the other file to `<table>.sql`, and the temporary file to the other name, and removes the record.
+The tables take their new names in memory only after the record is removed.
+`EXCHANGE TABLES`, `EXCHANGE DICTIONARIES`, exchanges between two databases and `Replicated` databases still fail on NFS.
+
+#### Loading a database with a leftover record {#metadata-on-nfs-load}
+
+A record is left only when the query that ran the swap did not succeed: the server crashed during the swap, or the swap failed
+and was fenced, as described below. Until then, the server served both tables under their old names. So when an `Atomic` database
+loads, it undoes every swap whose record is left, whether or not the setting is on: it restores both files to their contents from
+before the swap, and each table keeps the name the server served it with. The replacement table of `CREATE OR REPLACE` or
+`REPLACE TABLE` stays under its `_tmp_replace_*` name. Run the statement again, and then drop that table.
+
+This holds only with `fsync_metadata`, which is on by default. Without it, a crash right after a swap that succeeded can lose the
+removal of its record, and the load then undoes that swap, so the two tables go back to their names from before it. The server logs
+a warning the first time a database swaps without `fsync_metadata`.
+
+If a file holds neither of the recorded contents, the load fails with `CORRUPTED_DATA` and leaves the files as they are. At server
+start, the server then does not start until the files are repaired by hand, as the error describes.
+
+When the metadata disk is read-only, the load cannot undo a swap. It fails with `INCORRECT_FILE_NAME` unless both files still hold
+their contents from before the swap, and the error says to load the database once from a writable disk. When a file holds neither
+of the recorded contents, it fails with `CORRUPTED_DATA`, as on a writable disk.
+
+#### A swap that cannot be finished {#metadata-on-nfs-unfinished-swap}
+
+A rename on NFS can report an error after it succeeded, so after a failed rename the state of the files decides what happens.
+If no file changed, the renames are tried once more. A swap that a rename interrupted is finished from the record, and a swap
+whose renames completed is accepted. In every other case, and when the swap cannot remove its record, the swap leaves its record
+and fences its two tables until the server restarts:
+
+- DDL on the two tables, reads of their definitions and `BACKUP` of them fail with `UNFINISHED_METADATA_EXCHANGE`.
+- `DROP DATABASE`, `DETACH DATABASE` and `TRUNCATE DATABASE` of their database fail with the same error. They stop the refreshes
+  of the refreshable materialized views of the database that are not `APPEND` before their last check, so when that check refuses
+  them, these views stay stopped until the restart, and the error says so. Only a restart clears the fence.
+- `TRUNCATE ALL TABLES` fails with the same error, before it truncates any table, when one of the two tables is among the tables
+  it would truncate.
+- Inserts and selects keep working on the tables as they were before the swap.
+- A `ReplicatedMergeTree` table among the two cannot apply `ALTER` entries from its replication queue.
+- `system.warnings` has an entry about the last such swap.
+
+The error of the query that ran the swap, and an error in the server log, say what the restart does with the files. The restart
+undoes the swap from the record, as described above, so the rows inserted until then stay in their tables.
+
+The restart can keep the files exchanged in one case: the renames completed, but the server cannot tell whether the record will
+be there at the restart, because the removal of the record failed and the record could not be looked up, or because the removal
+could not be made durable. The errors of the swap say so. If the restart does not find the record, rows inserted into the replaced
+table until the restart are in the `_tmp_replace_*` table of `CREATE OR REPLACE` or `REPLACE TABLE`, or in the `.tmp` table of a
+refresh. Check a `_tmp_replace_*` table for them before dropping it. The first refresh after the restart replaces the `.tmp` table,
+so to check it first, start the server with `stop_refreshable_materialized_views_on_startup` enabled in the default profile, which
+keeps the refreshes stopped until `SYSTEM START VIEW`. After the check, start the views with `SYSTEM START VIEW` and remove the
+setting from the default profile again, because it stops the refreshes of every refreshable materialized view at each start.
+
+#### Downgrade {#metadata-on-nfs-downgrade}
+
+Before a downgrade to a version before 26.11, start the server once after a crash or after a fenced swap, so that the load undoes
+the swap. A version before 26.11 does not start while a database has a leftover `<table>.sql.tmp_exchange` file, because its load
+fails with `INCORRECT_FILE_NAME`. It ignores a leftover record without that file, and loads the two files as they are, which can be
+the contents from after a swap that the last server did not apply.
+
+If a version before 26.11 ran while a record was left, remove the leftover records `.<table>.sql.exchange` before upgrading again.
+The older version served the two files as they were, and the record does not show that. So the load of the newer version would undo
+the swap and put the two tables back under their old names, or, if DDL on the older version changed or removed either file, fail
+with `CORRUPTED_DATA`, and the server would not start until the files are repaired by hand.
 
 ### Limiting the number of tables {#limiting-the-number-of-tables}
 

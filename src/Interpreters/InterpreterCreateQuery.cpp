@@ -3403,6 +3403,7 @@ BlockIO InterpreterCreateQuery::doCreateOrReplaceTable(ASTCreateQuery & create,
         ContextPtr rename_context = is_plain_create ? ContextPtr{make_internal_context(/*bypass_size_guard=*/false)} : current_context;
         InterpreterRenameQuery interpreter_rename{ast_rename, rename_context};
         interpreter_rename.setSkipAccessCheck(true);
+        interpreter_rename.setAllowExchangeEmulation(true);
         interpreter_rename.setPreSwapCheck(
             [&current_context](const StorageID & to_drop_id)
             {
