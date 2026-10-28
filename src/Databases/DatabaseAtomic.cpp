@@ -26,6 +26,7 @@
 #include <Common/CurrentThread.h>
 #include <Common/FailPoint.h>
 #include <Common/LockMemoryExceptionInThread.h>
+#include <Common/Stopwatch.h>
 #include <Interpreters/ProcessList.h>
 
 
@@ -469,6 +470,10 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
                         old_metadata_path,
                         new_metadata_path);
 
+                /// The time the exchange adds while it holds `mutex`, which every lookup of a table of the database waits for.
+                /// On NFS each step below is a round trip to the server.
+                Stopwatch watch;
+
                 /// What each of the two files holds after the exchange.
                 MetadataExchangeRecord record;
                 record.old_path = old_metadata_path;
@@ -493,6 +498,8 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
                         warnAboutUnfinishedExchange(db_lock, table_name, to_table_name);
                     throw;
                 }
+                LOG_DEBUG(log, "Exchanged {} and {} with an exchange record in {:.3f} ms while holding the mutex of database {}",
+                    old_metadata_path, new_metadata_path, static_cast<double>(watch.elapsedMicroseconds()) / 1000.0, backQuote(database_name));
             }
         }
         else if (emulation_applies && allow_exchange_emulation)

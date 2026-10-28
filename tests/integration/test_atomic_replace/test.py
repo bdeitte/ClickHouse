@@ -1,4 +1,6 @@
+import logging
 import os
+import re
 import time
 from contextlib import contextmanager
 
@@ -188,6 +190,18 @@ def test_swap_on_nfs(started_cluster):
                 == "3"
             )
             assert exchange_files(list_files(nfs_db_dir)) == []
+
+            # How long each swap held the mutex of the database, which every lookup of its tables waits for. Logged, not
+            # asserted: the time depends on the NFS server and the machine.
+            hold_times = re.findall(
+                r"with an exchange record in ([0-9.]+) ms while holding the mutex of database `nfs_db`",
+                node.grep_in_log("while holding the mutex of database"),
+            )
+            assert len(hold_times) == 3, hold_times
+            logging.info(
+                "The swaps on NFS held the mutex of `nfs_db` for %s ms",
+                ", ".join(hold_times),
+            )
 
             # A crash between the moves of a swap: the server is killed while `c.sql` is missing, and the load at the restart
             # undoes the swap from the record.
