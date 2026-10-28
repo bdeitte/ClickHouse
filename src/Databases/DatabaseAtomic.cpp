@@ -774,9 +774,10 @@ std::vector<std::pair<ASTPtr, StoragePtr>> DatabaseAtomic::getTablesForBackup(co
 void DatabaseAtomic::checkNoUnfinishedExchange(const String & table_name) const
 {
     /// The caller holds the DDL guard of `table_name`, see `has_unfinished_exchange`, or accepts missing a fence set at the
-    /// same moment, see `StorageMaterializedView::checkTableCanBeDropped`. `DatabaseOverlay::getCreateTableQueryImpl` calls
-    /// it after a read of the definition that the fence refused in the same thread. With an empty name, the caller holds
-    /// no lock that an exchange takes, so the check locks `mutex` and waits for an exchange that holds it.
+    /// same moment, see `StorageMaterializedView::checkTableCanBeDropped` and `TRUNCATE ALL TABLES` in `InterpreterDropQuery`.
+    /// `DatabaseOverlay::getCreateTableQueryImpl` calls it after a read of the definition that the fence refused in the same thread.
+    /// With an empty name, the caller holds no lock that an exchange takes, so the check locks `mutex` and waits for an exchange
+    /// that holds it.
     if (!table_name.empty() && !has_unfinished_exchange.load(std::memory_order_relaxed))
         return;
     std::lock_guard lock{mutex};
@@ -952,6 +953,20 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
         return RecordState::Unknown;
     };
 
+    /// What the restart does after an exchange that left the two files as they were before it, but whose record `remove_record`
+    /// did not remove: `Left` or `Unknown`. The outcome is the same either way, because the load keeps two files that hold their
+    /// contents from before the exchange whether or not it finds the record.
+    auto record_left_or_unknown = [&](RecordState record_state) -> String
+    {
+        if (record_state == RecordState::Left)
+            return fmt::format("their record {} could not be removed, so {}", record_path, undo_outcome);
+        return fmt::format(
+            "it is not known whether their record {} is there at the restart: its removal failed and the record could not be "
+            "looked up, or the removal could not be made durable. If the record is there, {}. If it is not, the next load keeps "
+            "the two files, which hold their contents from before the exchange",
+            record_path, undo_outcome);
+    };
+
     /// A move can also report an error after it succeeded, so the state of the files decides, not the error.
     std::exception_ptr error;
 
@@ -970,11 +985,12 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
     {
         /// No file was moved, so the two files are as before the exchange. But a record that the failed write left would make
         /// the next load refuse the database once DDL changes either file, so it is removed, or the two tables are fenced.
-        if (remove_record() == RecordState::Removed)
+        const RecordState record_state = remove_record();
+        if (record_state == RecordState::Removed)
             std::rethrow_exception(error);
         fenceUnfinishedExchange(table_name, other_table_name, files,
             fmt::format(
-                "No file was moved, but the record {} could not be removed after its write failed, so {}", record_path, undo_outcome),
+                "The write of the record of the two files failed, so no file was moved, but {}", record_left_or_unknown(record_state)),
             error);
     }
 
@@ -1099,9 +1115,7 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
     {
         if (outcome == Outcome::FailCleanly)
             fenceUnfinishedExchange(table_name, other_table_name, files,
-                fmt::format(
-                    "The two files were not exchanged, but their record {} could not be removed, so {}", record_path, undo_outcome),
-                error);
+                fmt::format("The two files were not exchanged, but {}", record_left_or_unknown(record_state)), error);
         if (record_state == RecordState::Left)
             fenceUnfinishedExchange(table_name, other_table_name, files,
                 fmt::format(
@@ -1676,7 +1690,9 @@ and fences its two tables until the server restarts:
 - DDL on the two tables, reads of their definitions and `BACKUP` of them fail with `UNFINISHED_METADATA_EXCHANGE`.
 - `DROP DATABASE`, `DETACH DATABASE` and `TRUNCATE DATABASE` of their database fail with the same error. They stop the refreshes
   of the refreshable materialized views of the database that are not `APPEND` before their last check, so when that check refuses
-  them, these views stay stopped until the restart. Only a restart clears the fence.
+  them, these views stay stopped until the restart, and the error says so. Only a restart clears the fence.
+- `TRUNCATE ALL TABLES` fails with the same error, before it truncates any table, when one of the two tables is among the tables
+  it would truncate.
 - Inserts and selects keep working on the tables as they were before the swap.
 - A `ReplicatedMergeTree` table among the two cannot apply `ALTER` entries from its replication queue.
 - `system.warnings` has an entry about the last such swap.

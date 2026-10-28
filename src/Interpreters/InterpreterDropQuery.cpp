@@ -64,6 +64,7 @@ namespace ErrorCodes
     extern const int TABLE_NOT_EMPTY;
     extern const int TOO_MANY_SIMULTANEOUS_QUERIES;
     extern const int ASYNC_LOAD_CANCELED;
+    extern const int UNFINISHED_METADATA_EXCHANGE;
 }
 
 namespace ActionLocks
@@ -542,7 +543,7 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query, 
     }
 
     /// Before anything below changes the database or its tables. The guards of the tables, taken below, check each table
-    /// only after the tables are prepared for shutdown. `TRUNCATE ALL TABLES` only truncates data, so it does not need the check.
+    /// only after the tables are prepared for shutdown. `TRUNCATE ALL TABLES` checks only the tables it truncates, see below.
     /// A refresh of a view of the database that is running now can still fence two of its tables after this check, so the check
     /// runs again after the views whose refreshes swap tables, those that are not `APPEND`, are prepared for shutdown, which stops
     /// their refreshes and waits for a running one. A failure at the second check drops or detaches no table, but leaves those
@@ -662,7 +663,19 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query, 
                 /// The second check, see the first one above. The refreshes that swap tables of the database are stopped now,
                 /// and no other table is prepared for shutdown yet. Without such views, no refresh of a view of the database
                 /// can fence a table, so the first check is enough.
-                database->checkNoUnfinishedExchange(/* table_name */ "");
+                try
+                {
+                    database->checkNoUnfinishedExchange(/* table_name */ "");
+                }
+                catch (Exception & e)
+                {
+                    /// `flushAndPrepareForShutdown` shut down the refreshers of these views, and nothing starts them again.
+                    if (e.code() == ErrorCodes::UNFINISHED_METADATA_EXCHANGE)
+                        e.addMessage(
+                            "The refreshes of the refreshable materialized views of the database that are not `APPEND` were stopped "
+                            "before this check, and stay stopped until the server restarts");
+                    throw;
+                }
 
                 collect_tables();
             }
@@ -804,6 +817,12 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query, 
             }
             tables_to_truncate.push_back(storage_id);
         }
+
+        /// The tables are truncated in parallel, so a table whose exchange of metadata files could not be finished would be
+        /// refused by its DDL guard only after the other tables are truncated. Checked before any of them is truncated. Without
+        /// the guards, this can miss a fence set at the same moment, which the guard of that table still refuses.
+        for (const auto & table_id : tables_to_truncate)
+            database->checkNoUnfinishedExchange(table_id.table_name);
 
         /// Pre-cancel merges for all matching tables simultaneously.
         /// This ensures all merges start stopping at time 0, so that by the time

@@ -89,7 +89,11 @@ local_query 1 "
 
     -- The fence does not refuse inserts, and DDL on the other tables of the database goes on.
     INSERT INTO d.t VALUES (5);
+    INSERT INTO d.u VALUES (4);
     ALTER TABLE d.u ADD COLUMN z UInt8;
+    -- TRUNCATE ALL TABLES truncates its tables in parallel, so it is refused before it truncates any of them, including u.
+    TRUNCATE ALL TABLES FROM d; -- { serverError UNFINISHED_METADATA_EXCHANGE }
+    SELECT 'u rows after the refused TRUNCATE ALL TABLES: ' || arrayStringConcat(groupArray(toString(x)), ',') FROM d.u;
     -- The guard refused the DROP TABLE of t before it shut t down: a MergeTree table that was prepared for shutdown
     -- refuses OPTIMIZE with ABORTED.
     OPTIMIZE TABLE d.t FINAL;

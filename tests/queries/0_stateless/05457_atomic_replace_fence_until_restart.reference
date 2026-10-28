@@ -2,6 +2,7 @@ the start that fences
 warnings: 1
 the error of the fence refers to the error of the swap: 1
 unreadable definitions: 2
+u rows after the refused TRUNCATE ALL TABLES: 4
 the error of the refresh says what the restart does: 1
 refreshing views: 1
 errors without an expected code: 1
