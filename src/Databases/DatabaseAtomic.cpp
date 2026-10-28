@@ -963,15 +963,19 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
     /// What the restart does after an exchange that left the two files as they were before it, but whose record `remove_record`
     /// did not remove: `Left` or `Unknown`. The outcome is the same either way, because the load keeps two files that hold their
     /// contents from before the exchange whether or not it finds the record.
+    /// Why `remove_record` returned `Unknown`: the removal failed and the record could not be looked up, or the removal could
+    /// not be made durable.
+    const String record_unknown = fmt::format(
+        "it is not known whether their record {} is there at the restart, because its removal could not be checked or made durable",
+        record_path);
     auto record_left_or_unknown = [&](RecordState record_state) -> String
     {
         if (record_state == RecordState::Left)
             return fmt::format("their record {} could not be removed, so {}", record_path, undo_outcome);
         return fmt::format(
-            "it is not known whether their record {} is there at the restart: its removal failed and the record could not be "
-            "looked up, or the removal could not be made durable. If the record is there, {}. If it is not, the next load keeps "
-            "the two files, which hold their contents from before the exchange",
-            record_path, undo_outcome);
+            "{}. If the record is there, {}. If it is not, the next load keeps the two files, which hold their contents from "
+            "before the exchange",
+            record_unknown, undo_outcome);
     };
 
     /// A move can also report an error after it succeeded, so the state of the files decides, not the error.
@@ -1131,15 +1135,10 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
         /// The only case where the restart can keep the files exchanged while the server served the tables under their old names.
         fenceUnfinishedExchange(table_name, other_table_name, files,
             fmt::format(
-                "The two files were exchanged, but it is not known whether their record {} is there at the restart: its removal "
-                "failed and the record could not be looked up, or the removal could not be made durable. If the record is there, {}. "
-                "If it is not, the next load keeps the two files exchanged, and rows inserted into the replaced table until the "
-                "restart end up in the `_tmp_replace_*` table of `CREATE OR REPLACE` or `REPLACE TABLE`, which should be checked "
-                "for such rows before it is dropped, or in the `.tmp` table of a refresh, which the first refresh after the "
-                "restart replaces, unless the server starts with `stop_refreshable_materialized_views_on_startup` in the default "
-                "profile, which keeps the refreshes stopped until `SYSTEM START VIEW`. Remove that setting again after the check, "
-                "because it stops the refreshes of every refreshable materialized view at each start",
-                record_path, undo_outcome),
+                "The two files were exchanged, but {}. If the record is there, {}. If it is not, the next load keeps the two files "
+                "exchanged, and the rows inserted into the replaced table until the restart are in the `_tmp_replace_*` table, "
+                "or in the `.tmp` table of a refresh, which the first refresh after the restart replaces",
+                record_unknown, undo_outcome),
             record_error);
     }
 
@@ -1159,7 +1158,10 @@ void DatabaseAtomic::fenceUnfinishedExchange(
     hint += ". Until the restart, each of the two names keeps its table from before the exchange, and inserts reach those tables";
     /// Until the restart, the fence refuses the `CREATE OR REPLACE` of the `.tmp` table by the next refresh.
     hint += ". If the exchange was done by a refresh of a materialized view, the first refresh after the restart replaces the "
-        "leftover `.tmp` table. A `ReplicatedMergeTree` table among the two cannot apply `ALTER` entries until the restart";
+        "leftover `.tmp` table";
+    /// The documentation also lists what else the fence refuses, such as the `ALTER` entries of a `ReplicatedMergeTree` table,
+    /// and, for a record in the state `RecordState::Unknown`, how to check the `.tmp` table before the first refresh replaces it.
+    hint += ". The section `Metadata on NFS` of the documentation of the `Atomic` engine describes the fence and the recovery";
 
     unfinished_exchanges[table_name] = files;
     unfinished_exchanges[other_table_name] = files;

@@ -158,7 +158,8 @@ private:
 
     /// Fences an exchange that failed and could not be finished: adds `table_name` and `other_table_name` to `unfinished_exchanges`,
     /// then rethrows `error`. `hint` tells what the restart does about the metadata files `files` and where the rows inserted
-    /// until then end up. This function adds what the fence refuses and accepts until then, and adds the result to `error` and to
+    /// until then end up. This function adds what the fence accepts until then and a reference to the documentation, which
+    /// lists what the fence refuses, and adds the result to `error` and to
     /// the error it logs. The queries that the fence refuses later get a short error that refers to these two.
     [[noreturn]] void fenceUnfinishedExchange(
         const String & table_name,
@@ -188,9 +189,12 @@ private:
     /// `mutex`, so that the readers of definitions and the DDL guards of a database without a fence do not contend on it.
     /// The commit points still check under `mutex`.
     ///
-    /// It is set while the exchange holds `mutex`, `metadata_files_mutex` exclusively and the DDL guards of both names. So a reader
-    /// that then takes `metadata_files_mutex` shared, or a DDL that then takes the guard of either name, sees it: the unlock by the
-    /// exchange is ordered before that lock, and the store before the unlock. A reader of a definition also takes `mutex` in
+    /// It is set while the exchange holds `mutex` and the DDL guards of both names, and, once the moves have begun,
+    /// `metadata_files_mutex` exclusively. So a DDL that then takes the guard of either name sees it, and so does a reader that
+    /// then takes `metadata_files_mutex` shared after a fence set during the moves: the unlock by the exchange is ordered before
+    /// that lock, and the store before the unlock. A fence set because the write of the record failed is set before the exchange
+    /// takes `metadata_files_mutex`, so such a reader can miss it. That is harmless, because no file was moved, so the reader reads
+    /// the definition from before the exchange. A reader of a definition also takes `mutex` in
     /// `tryGetTable` before its first check (`DatabaseOnDisk::getCreateTableQueryImpl`), so it sees a fence set before. A reader
     /// whose first check runs while a failing exchange holds `mutex` can miss the fence there, and then fails on the missing file
     /// or sees the fence in its second check. `getTablesForBackup` checks after its reads, and a read leaves a table out because
