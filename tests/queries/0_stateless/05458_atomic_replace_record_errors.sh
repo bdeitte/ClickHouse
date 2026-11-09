@@ -91,8 +91,8 @@ local_query 1 "
     SELECT 't4 is not fenced';
 
     -- The moves complete and the record is removed, but the removal cannot be made durable, so it is not known whether the
-    -- record is there at the restart. The sync runs only with fsync_metadata, which the test runner randomizes.
-    SET fsync_metadata = 1;
+    -- record is there at the restart. The swap syncs even without fsync_metadata.
+    SET fsync_metadata = 0;
     CREATE DATABASE e UUID '$OTHER_UUID' ENGINE = Atomic;
     CREATE TABLE e.t5 (x UInt8) ENGINE = MergeTree ORDER BY x;
     INSERT INTO e.t5 VALUES (1);

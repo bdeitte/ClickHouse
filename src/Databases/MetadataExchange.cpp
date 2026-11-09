@@ -9,6 +9,7 @@
 #include <Common/logger_useful.h>
 
 #include <filesystem>
+#include <unistd.h>
 
 
 namespace fs = std::filesystem;
@@ -21,6 +22,7 @@ namespace ErrorCodes
     extern const int CANNOT_PARSE_ESCAPE_SEQUENCE;
     extern const int CORRUPTED_DATA;
     extern const int INCORRECT_FILE_NAME;
+    extern const int UNSUPPORTED_METHOD;
 }
 
 namespace
@@ -56,10 +58,10 @@ String metadataExchangeWritePath(const String & metadata_file_path)
     return (path.parent_path() / ("." + path.filename().string() + exchange_write_suffix)).string();
 }
 
-void replaceMetadataFile(const DiskPtr & disk, const String & path, const String & content, bool fsync)
+void replaceMetadataFile(const DiskPtr & disk, const String & path, const String & content)
 {
     const String write_path = metadataExchangeWritePath(path);
-    writeMetadataFile(disk, write_path, content, fsync);
+    writeMetadataFile(disk, write_path, content, /*fsync_metadata=*/true);
     disk->replaceFile(write_path, path);
 }
 
@@ -70,11 +72,10 @@ void writeMetadataExchangeFiles(
     const MetadataExchangeRecord & record,
     const String & old_path_content,
     const String & new_path_content,
-    bool fsync,
     const LoggerPtr & log)
 {
-    replaceMetadataFile(disk, record.old_path, old_path_content, fsync);
-    replaceMetadataFile(disk, record.new_path, new_path_content, fsync);
+    replaceMetadataFile(disk, record.old_path, old_path_content);
+    replaceMetadataFile(disk, record.new_path, new_path_content);
     /// Last, so that a crash before it leaves the exchange `Interrupted`, and the next load undoes it.
     const String tmp_path = metadataExchangeTmpPath(record.old_path);
     LOG_INFO(log, "Removing file {}", tmp_path);
@@ -148,14 +149,34 @@ void syncMetadataExchangeDirectory(const DiskPtr & disk, const String & file_pat
         guard->sync();
 }
 
-String writeMetadataExchangeRecord(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync)
+void checkMetadataExchangeFileNameLengths(const DiskPtr & disk, const MetadataExchangeRecord & record)
+{
+    /// All files of an exchange are in the directory of the two files, see `readMetadataExchangeRecord`.
+    const String dir = (fs::path(disk->getPath()) / record.old_path).parent_path().string();
+    const auto name_max = pathconf(dir.c_str(), _PC_NAME_MAX);
+    /// As in `computeMaxTableNameLength`.
+    const size_t max_length = name_max == -1 ? NAME_MAX : static_cast<size_t>(name_max);
+    /// The temporary record is longer than the record, and a finish or an undo writes through the two write files.
+    for (const auto & path : {metadataExchangeRecordPath(record.old_path) + ".tmp", metadataExchangeTmpPath(record.old_path),
+                              metadataExchangeWritePath(record.old_path), metadataExchangeWritePath(record.new_path)})
+    {
+        const String file_name = fs::path(path).filename().string();
+        if (file_name.size() > max_length)
+            throw Exception(
+                ErrorCodes::UNSUPPORTED_METHOD,
+                "Cannot exchange {} and {} with a record: the name of the file {} that the exchange may write has {} bytes, "
+                "and the directory allows at most {}. Rename the table to a shorter name",
+                record.old_path, record.new_path, file_name, file_name.size(), max_length);
+    }
+}
+
+String writeMetadataExchangeRecord(const DiskPtr & disk, const MetadataExchangeRecord & record)
 {
     const String record_path = metadataExchangeRecordPath(record.old_path);
-    writeMetadataFile(disk, record_path + ".tmp", serializeMetadataExchangeRecord(record), fsync);
+    writeMetadataFile(disk, record_path + ".tmp", serializeMetadataExchangeRecord(record), /*fsync_metadata=*/true);
     disk->replaceFile(record_path + ".tmp", record_path);
     /// Durable before the first move, which a crash could otherwise leave on disk without the record.
-    if (fsync)
-        syncMetadataExchangeDirectory(disk, record_path);
+    syncMetadataExchangeDirectory(disk, record_path);
     return record_path;
 }
 
@@ -201,12 +222,12 @@ MetadataExchangeState inspectMetadataExchange(const DiskPtr & disk, const Metada
     return MetadataExchangeState::Inconsistent;
 }
 
-void finishMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync, const LoggerPtr & log)
+void finishMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, const LoggerPtr & log)
 {
-    writeMetadataExchangeFiles(disk, record, record.old_path_content, record.new_path_content, fsync, log);
+    writeMetadataExchangeFiles(disk, record, record.old_path_content, record.new_path_content, log);
 }
 
-void undoMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync, const LoggerPtr & log)
+void undoMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, const LoggerPtr & log)
 {
     /// Without the temporary file, the writes below pass through a state where both files hold the same content, which a crash
     /// would leave `Inconsistent`. The temporary file, with the content it has during the exchange, keeps every state until the
@@ -215,10 +236,10 @@ void undoMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & r
     if (!disk->existsFile(tmp_path))
     {
         const String write_path = metadataExchangeWritePath(record.old_path);
-        writeMetadataFile(disk, write_path, record.new_path_content, fsync);
+        writeMetadataFile(disk, write_path, record.new_path_content, /*fsync_metadata=*/true);
         disk->replaceFile(write_path, tmp_path);
     }
-    writeMetadataExchangeFiles(disk, record, record.new_path_content, record.old_path_content, fsync, log);
+    writeMetadataExchangeFiles(disk, record, record.new_path_content, record.old_path_content, log);
 }
 
 namespace
@@ -328,7 +349,7 @@ void checkNoMetadataExchangeToUndo(const DiskPtr & disk, const String & metadata
     }
 }
 
-void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metadata_dir, bool fsync, const LoggerPtr & log)
+void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metadata_dir, const LoggerPtr & log)
 {
     const auto [record_paths, leftover_paths] = listMetadataExchangeFiles(disk, metadata_dir);
 
@@ -350,18 +371,17 @@ void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metad
         /// was fenced, the server served the two tables under their old names until the restart, and inserts reached them there.
         /// So the exchange is undone, not finished, which keeps each table under the name the server served it with. That holds
         /// with or without the temporary file: the moves or a finish may have completed before the crash or the fence.
-        /// This needs `fsync_metadata`. Without it, a crash can lose the removal of the record of an exchange that succeeded,
-        /// and this undoes that exchange. `DatabaseAtomic::renameTable` warns about such an exchange.
+        /// An exchange that succeeded made the removal of its record durable before the tables took their new names, so a crash
+        /// cannot bring its record back.
         switch (inspectMetadataExchange(disk, *record))
         {
             case MetadataExchangeState::BeforeExchange:
                 break;
             case MetadataExchangeState::Interrupted:
             case MetadataExchangeState::AfterExchange:
-                undoMetadataExchange(disk, *record, fsync, log);
+                undoMetadataExchange(disk, *record, log);
                 /// Durable before the record is removed below. Otherwise a crash could keep the removal and lose the undo.
-                if (fsync)
-                    syncMetadataExchangeDirectory(disk, record_path);
+                syncMetadataExchangeDirectory(disk, record_path);
                 LOG_WARNING(
                     log, "Undid the interrupted exchange of {} and {} recorded in {}: restored the contents the two files had before it",
                     record->old_path, record->new_path, record_path);
@@ -379,7 +399,7 @@ void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metad
 
     /// For the same reason, the removals are durable before the database loads and DDL can change the files. All records are
     /// in `metadata_dir`, so the first one gives the directory to sync.
-    if (fsync && removed_records)
+    if (removed_records)
         syncMetadataExchangeDirectory(disk, record_paths.front());
 }
 

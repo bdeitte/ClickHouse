@@ -153,8 +153,7 @@ private:
         const String & table_name,
         const String & other_table_name,
         const DiskPtr & disk,
-        const MetadataExchangeRecord & record,
-        bool fsync) TSA_REQUIRES(mutex);
+        const MetadataExchangeRecord & record) TSA_REQUIRES(mutex);
 
     /// Fences an exchange that failed and could not be finished: adds `table_name` and `other_table_name` to `unfinished_exchanges`,
     /// then rethrows `error`. `hint` tells what the restart does about the metadata files `files` and where the rows inserted
@@ -203,9 +202,6 @@ private:
     /// `unfinished_exchanges` under `mutex`, and a load ordered after a store sees it whatever its memory order, so
     /// `std::memory_order_relaxed` is enough.
     std::atomic<bool> has_unfinished_exchange{false};
-
-    /// Whether an exchange with a record without `fsync_metadata` has logged its warning, which is logged once per database.
-    std::atomic<bool> warned_about_exchange_without_fsync{false};
 };
 
 }

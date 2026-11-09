@@ -38,7 +38,6 @@ namespace Setting
 {
     extern const SettingsBool check_referential_table_dependencies;
     extern const SettingsBool check_table_dependencies;
-    extern const SettingsBool fsync_metadata;
 }
 
 namespace ServerSetting
@@ -480,16 +479,10 @@ void DatabaseAtomic::renameTable(ContextPtr local_context, const String & table_
                 record.new_path = new_metadata_path;
                 record.old_path_content = readMetadataFile(db_disk, new_metadata_path);
                 record.new_path_content = readMetadataFile(db_disk, old_metadata_path);
-                const bool fsync = local_context->getSettingsRef()[Setting::fsync_metadata];
-                /// Once per database, so that frequent refreshes do not repeat it.
-                if (!fsync && !warned_about_exchange_without_fsync.exchange(true, std::memory_order_relaxed))
-                    LOG_WARNING(log, "The exchange of {} and {} runs without `fsync_metadata`. If the server crashes after such an "
-                        "exchange succeeds, the removal of its record may be lost, and the next load then undoes the exchange, which "
-                        "puts the two tables back under their names from before it. This warning is logged once for database {}",
-                        old_metadata_path, new_metadata_path, backQuote(database_name));
+                checkMetadataExchangeFileNameLengths(db_disk, record);
                 try
                 {
-                    exchangeMetadataFilesWithRecord(table_name, to_table_name, db_disk, record, fsync);
+                    exchangeMetadataFilesWithRecord(table_name, to_table_name, db_disk, record);
                 }
                 catch (...)
                 {
@@ -861,8 +854,7 @@ bool DatabaseAtomic::undoInterruptedMetadataExchangesAtLoad() const
         checkNoMetadataExchangeToUndo(db_disk, getMetadataPath(), log);
         return false;
     }
-    const bool fsync = getContext()->getGlobalContext()->getSettingsRef()[Setting::fsync_metadata];
-    undoInterruptedMetadataExchanges(db_disk, getMetadataPath(), fsync, log);
+    undoInterruptedMetadataExchanges(db_disk, getMetadataPath(), log);
     return true;
 }
 
@@ -875,8 +867,7 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
     const String & table_name,
     const String & other_table_name,
     const DiskPtr & disk,
-    const MetadataExchangeRecord & record,
-    bool fsync)
+    const MetadataExchangeRecord & record)
 {
     /// The exchange must be able to fence the two tables at every step, even when the query is over its memory limit. Otherwise
     /// an allocation for the hint or for `unfinished_exchanges` could throw before both names are fenced, and DDL could change the
@@ -943,8 +934,6 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
         }
         /// The record decides what the next load does, so its removal is made durable before the caller renames the tables
         /// in memory. The sync also makes the moves durable, because they are in the same directory.
-        if (!fsync)
-            return RecordState::Removed;
         try
         {
             fiu_do_on(FailPoints::database_atomic_exchange_fail_to_sync_removed_record,
@@ -984,7 +973,7 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
     /// Without `metadata_files_mutex`: until the first move, readers do not need to wait.
     try
     {
-        writeMetadataExchangeRecord(disk, record, fsync);
+        writeMetadataExchangeRecord(disk, record);
         fiu_do_on(FailPoints::database_atomic_exchange_fail_after_writing_record,
             { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after writing an exchange record"); });
     }
@@ -1066,7 +1055,7 @@ void DatabaseAtomic::exchangeMetadataFilesWithRecord(
                 case MetadataExchangeState::Interrupted:
                     fiu_do_on(FailPoints::database_atomic_exchange_fail_to_finish,
                         { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault before finishing an exchange"); });
-                    finishMetadataExchange(disk, record, fsync, log);
+                    finishMetadataExchange(disk, record, log);
                     /// As when the removal of the temporary file at the end of the finish reports an error after it succeeded.
                     fiu_do_on(FailPoints::database_atomic_exchange_fail_after_finish,
                         { throw Exception(ErrorCodes::FAULT_INJECTED, "Injecting fault after finishing an exchange"); });
@@ -1678,9 +1667,8 @@ loads, it undoes every swap whose record is left, whether or not the setting is 
 before the swap, and each table keeps the name the server served it with. The replacement table of `CREATE OR REPLACE` or
 `REPLACE TABLE` stays under its `_tmp_replace_*` name. Run the statement again, and then drop that table.
 
-This holds only with `fsync_metadata`, which is on by default. Without it, a crash right after a swap that succeeded can lose the
-removal of its record, and the load then undoes that swap, so the two tables go back to their names from before it. The server logs
-a warning the first time a database swaps without `fsync_metadata`.
+The swap and the undo sync the files they write, and the directory after each step that the next load depends on, even when
+`fsync_metadata` is off. So a crash cannot lose the removal of the record of a swap that succeeded.
 
 If a file holds neither of the recorded contents, the load fails with `CORRUPTED_DATA` and leaves the files as they are. At server
 start, the server then does not start until the files are repaired by hand, as the error describes.

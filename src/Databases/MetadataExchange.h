@@ -14,6 +14,10 @@ namespace DB
 /// `old_path` to the temporary file `old_path + ".tmp_exchange"`, `new_path` to `old_path`, and the temporary file to `new_path`.
 /// Before the moves, a record of the exchange is written next to `old_path`, so that loading the database can undo
 /// an interrupted exchange.
+/// Every write is synced, and so is the directory after every step whose order the next load depends on, whatever
+/// `fsync_metadata` is. Without that, a crash could keep a later step and lose an earlier one: lose the removal of the record of
+/// an exchange that succeeded, so that the next load undoes it, or keep the `DROP` of the replaced table after such an exchange,
+/// so that the next load finds a file of the record missing and fails with `CORRUPTED_DATA`.
 
 /// The two metadata files of an exchange and what each of them holds after it. Paths are relative to the disk.
 struct MetadataExchangeRecord
@@ -42,9 +46,14 @@ std::optional<MetadataExchangeRecord> parseMetadataExchangeRecord(const String &
 /// Syncs the directory of the file `file_path` to the storage device, so that the renames and removals of files in it are durable.
 void syncMetadataExchangeDirectory(const DiskPtr & disk, const String & file_path);
 
-/// Writes the record next to `record.old_path`, as `<record>.tmp` that is then put in place with `replaceFile`.
-/// With `fsync`, it also syncs the directory, so that the record is durable before the first move. Returns the path of the record.
-String writeMetadataExchangeRecord(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync);
+/// Throws `UNSUPPORTED_METHOD` when a file that the exchange or its finish or undo may write would have a name longer than
+/// the directory of the two files allows. Called before the record is written, so that such an exchange fails as a query
+/// and never leaves a record that no load could undo.
+void checkMetadataExchangeFileNameLengths(const DiskPtr & disk, const MetadataExchangeRecord & record);
+
+/// Writes the record next to `record.old_path`, as `<record>.tmp` that is then put in place with `replaceFile`, and syncs the
+/// directory, so that the record is durable before the first move. Returns the path of the record.
+String writeMetadataExchangeRecord(const DiskPtr & disk, const MetadataExchangeRecord & record);
 
 /// Removes leftover temporary records and writes of a finish or an undo, which a crash left. Best effort: they are harmless,
 /// and the next load removes them again.
@@ -71,17 +80,17 @@ MetadataExchangeState inspectMetadataExchange(const DiskPtr & disk, const Metada
 
 /// Writes each recorded content to `dir/.<file>.exchange_write` and puts it in place with `replaceFile`, then removes the temporary file,
 /// which it logs to `log`. For an exchange that a move interrupted with an error, after which the server applies the exchange in memory.
-void finishMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync, const LoggerPtr & log);
+void finishMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, const LoggerPtr & log);
 
 /// Like `finishMetadataExchange`, but writes the contents from before the exchange: `new_path_content` to `old_path`,
 /// and `old_path_content` to `new_path`. Without the temporary file, it first writes the temporary file, so that a crash
 /// during the undo leaves the exchange `Interrupted`.
-void undoMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, bool fsync, const LoggerPtr & log);
+void undoMetadataExchange(const DiskPtr & disk, const MetadataExchangeRecord & record, const LoggerPtr & log);
 
 /// Called when a database on `disk` is loaded. Removes leftover temporary records and writes of a finish or an undo in
 /// `metadata_dir`, undoes the exchanges recorded there whose files are not as before them, and removes their records.
 /// Throws `CORRUPTED_DATA` and leaves the files as they are when the files of an exchange hold contents it did not record.
-void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metadata_dir, bool fsync, const LoggerPtr & log);
+void undoInterruptedMetadataExchanges(const DiskPtr & disk, const String & metadata_dir, const LoggerPtr & log);
 
 /// Called instead of `undoInterruptedMetadataExchanges` when a database on a read-only `disk` is loaded. Throws
 /// `CORRUPTED_DATA`, as `undoInterruptedMetadataExchanges` does, when the files of an exchange recorded in `metadata_dir` hold
