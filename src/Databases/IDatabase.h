@@ -451,13 +451,17 @@ public:
     virtual Strings getNamesOfPermanentlyDetachedTables() const;
 
     /// Rename the table and possibly move the table to another database.
+    /// `allow_exchange_emulation` lets `DatabaseAtomic` emulate an exchange of the metadata files with three moves and a record
+    /// where the filesystem cannot exchange them atomically. Only the internal exchanges of `CREATE OR REPLACE` and of refreshes
+    /// of materialized views pass `true`, see `InterpreterRenameQuery::setAllowExchangeEmulation`.
     virtual void renameTable(
         ContextPtr /*context*/,
         const String & /*name*/,
         IDatabase & /*to_database*/,
         const String & /*to_name*/,
         bool /*exchange*/,
-        bool /*dictionary*/);
+        bool /*dictionary*/,
+        bool /*allow_exchange_emulation*/);
 
     using ASTModifier = std::function<void(IAST &)>;
 
@@ -552,6 +556,15 @@ public:
     virtual bool shouldBeEmptyOnDetach() const { return true; }
 
     virtual void assertCanBeDetached(bool /*cleanup*/) {}
+
+    /// Throws while an exchange of the metadata file of `table_name` failed and could not be finished, until the server restarts.
+    /// With an empty `table_name`, throws while this is so for any table of the database.
+    /// `DatabaseCatalog::getDDLGuard` calls it for the name it guards, and `DatabaseCatalog::tryGetDDLGuard` once it owns the lock
+    /// of the name, before the query changes anything. An exchange sets this state only while it holds the DDL guards of both
+    /// of its names, so the answer does not change while the guard is held.
+    /// `DROP DATABASE`, `DETACH DATABASE` and `TRUNCATE DATABASE` call it with an empty name. A database that wraps others, such as `DatabaseOverlay`,
+    /// must ask the databases it wraps.
+    virtual void checkNoUnfinishedExchange(const String & /*table_name*/) const {}
 
     virtual void waitDetachedTableNotInUse(const UUID & /*uuid*/, std::function<void()> /*throw_if_cancelled*/) { }
     virtual void checkDetachedTableNotInUse(const UUID & /*uuid*/) { }

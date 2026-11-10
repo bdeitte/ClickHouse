@@ -1,0 +1,70 @@
+case 1: the record only, before the swap
+a: x
+b: x,y
+x: x
+y: x,y
+a rows: 1
+b rows: 2,3
+x rows: 4
+y rows: 5,6
+.a.sql.exchange
+the record is untouched
+
+case 2: after the third move, before the record is removed
+the disk is read-only
+INCORRECT_FILE_NAME
+.a.sql.exchange
+the record is untouched
+a.sql is untouched
+b.sql is untouched
+a: x
+b: x,y
+x: x
+y: x,y
+a rows: 1
+b rows: 2,3
+x rows: 4
+y rows: 5,6
+
+case 3: after the first move
+the disk is read-only
+INCORRECT_FILE_NAME
+.a.sql.exchange
+the temporary file is untouched
+b.sql is untouched
+a.sql is missing
+
+case 4: the record only, and a metadata file with neither of the recorded contents
+CORRUPTED_DATA
+.a.sql.exchange
+a.sql is untouched
+b.sql is untouched
+
+case 5: a swap that needs an undo, and a swap with a metadata file that holds neither of the recorded contents
+CORRUPTED_DATA
+.a.sql.exchange
+.x.sql.exchange
+a.sql is untouched
+x.sql is untouched
+
+case 6: a swap with a metadata file that holds neither of the recorded contents, and a swap that needs an undo
+CORRUPTED_DATA
+.a.sql.exchange
+.x.sql.exchange
+a.sql is untouched
+x.sql is untouched
+
+case 7: the temporary file without a record
+on a local disk that is writable
+INCORRECT_FILE_NAME
+the temporary file is left
+
+after the cases
+a: x
+b: x,y
+x: x
+y: x,y
+a rows: 1
+b rows: 2,3
+x rows: 4
+y rows: 5,6

@@ -1263,6 +1263,7 @@ DDLGuardPtr DatabaseCatalog::getDDLGuard(const String & database, const String &
     if (expected_database && expected_database != tryGetDatabase(database).get())
         throw Exception(ErrorCodes::UNFINISHED, "The database {} was dropped or renamed concurrently", database);
 
+    checkNoUnfinishedExchange(database, table);
     return guard;
 }
 
@@ -1286,7 +1287,19 @@ DDLGuardPtr DatabaseCatalog::tryGetDDLGuard(
     if (expected_database && expected_database != tryGetDatabase(database).get())
         throw Exception(ErrorCodes::UNFINISHED, "The database {} was dropped or renamed concurrently", database);
 
+    checkNoUnfinishedExchange(database, table);
     return guard;
+}
+
+void DatabaseCatalog::checkNoUnfinishedExchange(const String & database, const String & table) const
+{
+    /// Called with the guard of `table` held. An exchange of metadata files leaves a fence on a name only while it holds
+    /// the guard of that name, so the answer cannot change until the guard is released, and a query that holds the guard
+    /// is refused before it changes anything. A guard of the whole database (an empty name) does not check.
+    if (table.empty())
+        return;
+    if (auto db = tryGetDatabase(database))
+        db->checkNoUnfinishedExchange(table);
 }
 
 DDLGuardPtr DatabaseCatalog::tryGetDDLGuardForStorage(

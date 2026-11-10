@@ -219,7 +219,8 @@ void IDatabase::renameTable(
     IDatabase & /*to_database*/,
     const String & /*to_name*/,
     bool /*exchange*/,
-    bool /*dictionary*/)
+    bool /*dictionary*/,
+    bool /*allow_exchange_emulation*/)
 {
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{}: renameTable() is not supported", getEngineName());
 }

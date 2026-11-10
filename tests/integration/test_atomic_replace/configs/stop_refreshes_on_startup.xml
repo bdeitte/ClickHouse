@@ -1,0 +1,8 @@
+<clickhouse>
+    <!-- A refreshable view loaded at a restart would refresh at once, because its definition does not keep `EMPTY`. -->
+    <profiles>
+        <default>
+            <stop_refreshable_materialized_views_on_startup>1</stop_refreshable_materialized_views_on_startup>
+        </default>
+    </profiles>
+</clickhouse>

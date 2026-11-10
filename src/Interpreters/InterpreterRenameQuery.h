@@ -83,6 +83,12 @@ public:
     /// For an internal rename that moves a table away to create its replacement under the same name.
     void setKeepSourceViewDependencies(bool keep) { keep_source_view_dependencies = keep; }
 
+    /// Let an `Atomic` database emulate the exchange of the two metadata files with three moves and a record where the
+    /// filesystem cannot exchange them atomically, such as NFS, see the server setting `database_atomic_allow_exchange_emulation`.
+    /// Set only by `InterpreterCreateQuery::doCreateOrReplaceTable` and `StorageMaterializedView::exchangeTargetTable`,
+    /// never for a user `RENAME` or `EXCHANGE`.
+    void setAllowExchangeEmulation(bool allow) { allow_exchange_emulation = allow; }
+
     void extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr & ast, ContextPtr) const override;
 
     bool renamedInsteadOfExchange() const { return renamed_instead_of_exchange; }
@@ -103,6 +109,7 @@ private:
     bool renamed_instead_of_exchange{false};
     bool skip_access_check{false};
     bool keep_source_view_dependencies{false};
+    bool allow_exchange_emulation{false};
     PreSwapCheck pre_swap_check;
 };
 

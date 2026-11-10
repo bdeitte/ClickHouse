@@ -225,6 +225,7 @@ void DatabaseBackup::renameTable(
     IDatabase &,
     const String &,
     bool,
+    bool,
     bool)
 {
     throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "RENAME TABLE is not supported for Backup database");

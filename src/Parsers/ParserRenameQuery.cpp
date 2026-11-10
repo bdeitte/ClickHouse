@@ -185,6 +185,7 @@ This task can also be accomplished with a [`RENAME`](/reference/statements/renam
 
 <Note>
 The `EXCHANGE` query is supported by the [`Atomic`](/reference/engines/database-engines/atomic) and [`Shared`](/products/cloud/features/infrastructure/shared-catalog#shared-database-engine) database engines only.
+In an `Atomic` database, it also needs a filesystem that can exchange two files atomically. It fails with `UNSUPPORTED_METHOD` when the metadata of the database is on NFS, see [Metadata on NFS](/reference/engines/database-engines/atomic#metadata-on-nfs).
 </Note>
 
 **Syntax**

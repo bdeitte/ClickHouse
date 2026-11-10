@@ -1,0 +1,39 @@
+# A user-space NFS server (NFS-Ganesha, NFSv4 only) that exports the volume `nfs-export` as the NFSv4 root `/`.
+# It needs no privileged mode and no `nfsd` module on the host. A test mounts the export in an instance with
+# `mount -t nfs4 -o vers=4.2,addr=<IP of nfs1> <IP of nfs1>:/ <directory>`, which also works without `mount.nfs`.
+services:
+  nfs1:
+    # The image has a single maintainer. `mirror-images.sh` mirrors it as `clickhouse/hectorm-nfs-ganesha:v11`:
+    # switch to that name once the mirror is pushed.
+    image: hectorm/nfs-ganesha:v11
+    restart: "no"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - DAC_READ_SEARCH
+      - FOWNER
+      - FSETID
+      - SETGID
+      - SETUID
+      - SYS_RESOURCE
+    expose:
+      - 2049
+    volumes:
+      # A named volume, because the exported directory must support file handles, which overlayfs does not give.
+      - nfs-export:/export
+    tmpfs:
+      - /run
+      - /tmp
+      - /recovery
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/2049"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+    stop_grace_period: 5s
+
+volumes:
+  nfs-export:

@@ -28,6 +28,7 @@ IMAGES=(
     "ghcr.io/letsencrypt/pebble-challtestsrv:2.9.0            clickhouse/letsencrypt-pebble-challtestsrv:2.9.0"
     "pgsty/minio:RELEASE.2026-08-04T00-00-00Z                 clickhouse/minio-minio:RELEASE.2026-08-04T00-00-00Z"
     "pgsty/mc:RELEASE.2026-09-16T00-00-00Z                    clickhouse/minio-mc:RELEASE.2026-09-16T00-00-00Z"
+    "hectorm/nfs-ganesha:v11                                  clickhouse/hectorm-nfs-ganesha:v11"
 )
 
 for entry in "${IMAGES[@]}"; do

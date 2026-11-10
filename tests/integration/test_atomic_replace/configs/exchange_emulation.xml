@@ -1,0 +1,4 @@
+<clickhouse>
+    <!-- The tests of exchanges with a record force the record path with a failpoint, which needs the emulation enabled. -->
+    <database_atomic_allow_exchange_emulation>1</database_atomic_allow_exchange_emulation>
+</clickhouse>
